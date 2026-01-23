@@ -1,0 +1,8 @@
+command to build:
+
+make clean 
+make 
+
+command to flash:
+
+JLinkExe -CommanderScript flash.jlink

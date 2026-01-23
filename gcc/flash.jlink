@@ -1,0 +1,9 @@
+device AMA4B2KP-KBR
+if SWD
+speed 4000
+connect
+r
+loadfile bin/ble_freertos_fit.axf
+r
+go
+q
