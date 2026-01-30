@@ -104,7 +104,7 @@ TaskHandle_t radio_task_handle;
 //
 //*****************************************************************************
 void exactle_stack_init(void);
-
+void HelloJsonSvcAdd(void);
 //*****************************************************************************
 //
 // WSF buffer pools.
@@ -302,6 +302,8 @@ RadioTask(void *pvParameters)
     //
     // Start the "Fit" profile.
     //
+    HelloJsonSvcAdd();
+
     FitStart();
 
     while (1)
