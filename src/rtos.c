@@ -9,44 +9,6 @@
 //
 //*****************************************************************************
 
-//*****************************************************************************
-//
-// Copyright (c) 2022, Ambiq Micro, Inc.
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright
-// notice, this list of conditions and the following disclaimer in the
-// documentation and/or other materials provided with the distribution.
-//
-// 3. Neither the name of the copyright holder nor the names of its
-// contributors may be used to endorse or promote products derived from this
-// software without specific prior written permission.
-//
-// Third party software included in this distribution is subject to the
-// additional license terms as defined in the /docs/licenses directory.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-// POSSIBILITY OF SUCH DAMAGE.
-//
-// This is part of revision release_sdk_4_3_0-0ca7d78a2b of the AmbiqSuite Development Package.
-//
-//*****************************************************************************
-
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -60,12 +22,58 @@
 #include "portable.h"
 #include "ble_freertos_fit.h"
 
-//*****************************************************************************
-//
-// Task handle for the initial setup task.
-//
-//*****************************************************************************
+extern TaskHandle_t radio_task_handle;
+
+extern void HelloJsonOnButton0Pressed(void);
+
 TaskHandle_t xSetupTask;
+
+static void
+ButtonTask(void *pvParameters)
+{
+    (void)pvParameters;
+
+    am_hal_gpio_pinconfig(AM_BSP_GPIO_BUTTON0, g_AM_BSP_GPIO_BUTTON0);
+
+    const TickType_t period = pdMS_TO_TICKS(10);
+    TickType_t lastWake = xTaskGetTickCount();
+
+    bool armed = true;
+    uint8_t lowCount = 0;
+
+    while (1)
+    {
+        vTaskDelayUntil(&lastWake, period);
+
+        bool cur = am_hal_gpio_input_read(AM_BSP_GPIO_BUTTON0);
+
+        if (armed)
+        {
+            if (!cur)
+            {
+                if (lowCount < 4) lowCount++;
+                if (lowCount >= 4)
+                {
+                    HelloJsonOnButton0Pressed();
+                    armed = false;
+                    lowCount = 0;
+                }
+            }
+            else
+            {
+                lowCount = 0;
+            }
+        }
+        else
+        {
+            if (cur)
+            {
+                armed = true;
+                lowCount = 0;
+            }
+        }
+    }
+}
 
 //*****************************************************************************
 //
@@ -117,13 +125,6 @@ void am_freertos_wakeup(uint32_t idleTime)
 void
 vApplicationMallocFailedHook(void)
 {
-    //
-    // Called if a call to pvPortMalloc() fails because there is insufficient
-    // free memory available in the FreeRTOS heap.  pvPortMalloc() is called
-    // internally by FreeRTOS API functions that create tasks, queues, software
-    // timers, and semaphores.  The size of the FreeRTOS heap is set by the
-    // configTOTAL_HEAP_SIZE configuration constant in FreeRTOSConfig.h.
-    //
     while (1);
 }
 
@@ -133,14 +134,9 @@ vApplicationStackOverflowHook(TaskHandle_t pxTask, char *pcTaskName)
     (void) pcTaskName;
     (void) pxTask;
 
-    //
-    // Run time stack overflow checking is performed if
-    // configconfigCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2.  This hook
-    // function is called if a stack overflow is detected.
-    //
     while (1)
     {
-        __asm("BKPT #0\n") ; // Break into the debugger
+        __asm("BKPT #0\n") ;
     }
 }
 
@@ -148,32 +144,18 @@ vApplicationStackOverflowHook(TaskHandle_t pxTask, char *pcTaskName)
 //
 // High priority task to run immediately after the scheduler starts.
 //
-// This task is used for any global initialization that must occur after the
-// scheduler starts, but before any functional tasks are running. This can be
-// useful for enabling events, semaphores, and other global, RTOS-specific
-// features.
-//
 //*****************************************************************************
 void
 setup_task(void *pvParameters)
 {
-    //
-    // Print a debug message.
-    //
     am_util_debug_printf("Running setup tasks...\r\n");
 
-    //
-    // Run setup functions.
-    //
     RadioTaskSetup();
 
-    //
-    // Create the functional tasks
-    //
     xTaskCreate(RadioTask, "RadioTask", 512, 0, 3, &radio_task_handle);
-    //
-    // The setup operations are complete, so suspend the setup task now.
-    //
+
+    xTaskCreate(ButtonTask, "ButtonTask", 256, 0, 2, NULL);
+
     vTaskSuspend(NULL);
 
     while (1);
@@ -187,21 +169,7 @@ setup_task(void *pvParameters)
 void
 run_tasks(void)
 {
-    //
-    // Set some interrupt priorities before we create tasks or start the scheduler.
-    //
-    // Note: Timer priority is handled by the FreeRTOS kernel, so we won't
-    // touch it here.
-    //
-
-    //
-    // Create essential tasks.
-    //
     xTaskCreate(setup_task, "Setup", 512, 0, 3, &xSetupTask);
 
-    //
-    // Start the scheduler.
-    //
     vTaskStartScheduler();
 }
-
