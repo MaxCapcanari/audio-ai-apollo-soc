@@ -15,6 +15,8 @@
 #define HELLO_CCC_HDL        (HELLO_SVC_START_HDL + 3)
 #define HELLO_SVC_END_HDL    (HELLO_SVC_START_HDL + 3)
 
+#define HELLO_CCC_OFFSET   16
+#define HELLO_CCC_TBL_LEN  (HELLO_CCC_OFFSET + 1)
 
 static const uint8_t helloSvcUuid[ATT_128_UUID_LEN] =
 {
@@ -40,10 +42,10 @@ static uint16_t helloSvcUuidLen = sizeof(helloSvcUuid);
 static uint16_t helloChDeclLen  = sizeof(helloChDecl);
 
 static uint8_t  helloValBuf[128];
-static uint16_t helloValLen     = 0;
+static uint16_t helloValLen = 0;
 
-static uint8_t  helloCccVal[2]  = { 0x00, 0x00 };
-static uint16_t helloCccLen     = sizeof(helloCccVal);
+static uint8_t  helloCccVal[2] = { 0x00, 0x00 };
+static uint16_t helloCccLen = sizeof(helloCccVal);
 
 static attsAttr_t helloSvcList[] =
 {
@@ -81,10 +83,15 @@ static attsAttr_t helloSvcList[] =
   }
 };
 
-static attsCccSet_t helloCccSet[1] =
+static attsCccSet_t helloCccSet[] =
 {
-  { HELLO_CCC_HDL, ATT_CLIENT_CFG_NOTIFY, 0 }
+  { HELLO_CCC_HDL, ATT_CLIENT_CFG_NOTIFY, 16 }
 };
+
+
+
+static uint16_t helloCccTbl[HELLO_CCC_TBL_LEN] = { 0 };
+
 
 static attsGroup_t helloSvcGroup =
 {
@@ -95,7 +102,6 @@ static attsGroup_t helloSvcGroup =
   HELLO_SVC_START_HDL,
   HELLO_SVC_END_HDL
 };
-
 
 static dmConnId_t g_connId = DM_CONN_ID_NONE;
 static bool_t     g_notifyEnabled = FALSE;
@@ -109,7 +115,8 @@ static void helloSetJsonWithUptime(const char *deviceName)
   uint32_t minutes = (totalSeconds % 3600U) / 60U;
   uint32_t seconds = totalSeconds % 60U;
 
-  int n = snprintf((char *)helloValBuf, sizeof(helloValBuf),
+  int n = snprintf((char *)helloValBuf,
+                   sizeof(helloValBuf),
                    "{\"device\":\"%s\",\"message\":\"hello\",\"uptime\":\"%02lu:%02lu:%02lu\"}",
                    deviceName,
                    (unsigned long)hours,
@@ -157,6 +164,7 @@ static void helloDmCback(dmEvt_t *pEvt)
   {
     case DM_CONN_OPEN_IND:
       g_connId = (dmConnId_t)pEvt->hdr.param;
+      AttsCccInitTable(g_connId, helloCccTbl);
       break;
 
     case DM_CONN_CLOSE_IND:
@@ -177,15 +185,22 @@ void HelloJsonSvcAdd(void)
 
   AttsAddGroup(&helloSvcGroup);
 
-  AttsCccRegister(sizeof(helloCccSet)/sizeof(helloCccSet[0]), helloCccSet, helloCccCback);
-  DmRegister(helloDmCback);
+  AttsCccRegister((uint8_t)(sizeof(helloCccSet) / sizeof(helloCccSet[0])),
+                  helloCccSet,
+                  helloCccCback);
 }
+
 
 void HelloJsonOnButton0Pressed(void)
 {
   helloSetJsonWithUptime("Apollo4");
-
   am_util_debug_printf("Sending message: %s\r\n", (char *)helloValBuf);
-
   helloNotify();
 }
+
+void HelloJsonRegisterConnCallback(uint8_t clientId)
+{
+  DmConnRegister(clientId, helloDmCback);
+}
+
+

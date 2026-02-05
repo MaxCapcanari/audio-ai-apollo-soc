@@ -40,7 +40,8 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 //
-// This is part of revision release_sdk_4_3_0-0ca7d78a2b of the AmbiqSuite Development Package.
+// This is part of revision release_sdk_4_3_0-0ca7d78a2b of the AmbiqSuite
+// Development Package.
 //
 //*****************************************************************************
 
@@ -57,28 +58,29 @@
 //
 //*****************************************************************************
 #include "wsf_types.h"
-#include "wsf_trace.h"
 #include "wsf_buf.h"
 #include "wsf_timer.h"
+#include "wsf_trace.h"
+
 
 //*****************************************************************************
 //
 // Includes for operating the ExactLE stack.
 //
 //*****************************************************************************
-#include "hci_handler.h"
-#include "dm_handler.h"
-#include "l2c_handler.h"
-#include "att_handler.h"
-#include "smp_handler.h"
-#include "l2c_api.h"
-#include "att_api.h"
-#include "smp_api.h"
 #include "app_api.h"
+#include "att_api.h"
+#include "att_handler.h"
+#include "dm_handler.h"
 #include "hci_core.h"
 #include "hci_drv.h"
 #include "hci_drv_apollo.h"
 #include "hci_drv_cooper.h"
+#include "hci_handler.h"
+#include "l2c_api.h"
+#include "l2c_handler.h"
+#include "smp_api.h"
+#include "smp_handler.h"
 
 #include "hci_apollo_config.h"
 #include "wsf_msg.h"
@@ -88,8 +90,8 @@
 // Includes for the ExactLE "fit" profile.
 //
 //*****************************************************************************
-#include "fit_api.h"
 #include "app_ui.h"
+#include "fit_api.h"
 
 //*****************************************************************************
 //
@@ -105,32 +107,28 @@ TaskHandle_t radio_task_handle;
 //*****************************************************************************
 void exactle_stack_init(void);
 void HelloJsonSvcAdd(void);
+void HelloJsonRegisterConnCallback(uint8_t clientId);
 //*****************************************************************************
 //
 // WSF buffer pools.
 //
 //*****************************************************************************
-#define WSF_BUF_POOLS               4
+#define WSF_BUF_POOLS 4
 
-// Important note: the size of g_pui32BufMem should includes both overhead of internal
-// buffer management structure, wsfBufPool_t (up to 16 bytes for each pool), and pool
-// description (e.g. g_psPoolDescriptors below).
-// The length of buffers in pool MUST be a multiple of sizeof(wsfBufMem_t), which is 8
-// by default. Or it may cause WSF buffer pool initialization failure.
+// Important note: the size of g_pui32BufMem should includes both overhead of
+// internal buffer management structure, wsfBufPool_t (up to 16 bytes for each
+// pool), and pool description (e.g. g_psPoolDescriptors below). The length of
+// buffers in pool MUST be a multiple of sizeof(wsfBufMem_t), which is 8 by
+// default. Or it may cause WSF buffer pool initialization failure.
 
 // Memory for the buffer pool
 // extra AMOTA_PACKET_SIZE bytes for OTA handling
-static uint32_t g_pui32BufMem[
-        (WSF_BUF_POOLS*16
-         + 16*8 + 32*4 + 64*6 + 280*14) / sizeof(uint32_t)];
+static uint32_t
+    g_pui32BufMem[(WSF_BUF_POOLS * 16 + 16 * 8 + 32 * 4 + 64 * 6 + 280 * 14) /
+                  sizeof(uint32_t)];
 // Default pool descriptor.
-static wsfBufPoolDesc_t g_psPoolDescriptors[WSF_BUF_POOLS] =
-{
-    {  16,  8 },
-    {  32,  4 },
-    {  64,  6 },
-    { 280,  14 }
-};
+static wsfBufPoolDesc_t g_psPoolDescriptors[WSF_BUF_POOLS] = {
+    {16, 8}, {32, 4}, {64, 6}, {280, 14}};
 
 //*****************************************************************************
 //
@@ -140,85 +138,81 @@ static wsfBufPoolDesc_t g_psPoolDescriptors[WSF_BUF_POOLS] =
 
 void radio_timer_handler(void);
 
-
 //*****************************************************************************
 //
 // Initialization for the ExactLE stack.
 //
 //*****************************************************************************
-void
-exactle_stack_init(void)
-{
-    wsfHandlerId_t handlerId;
-    uint16_t       wsfBufMemLen;
-    //
-    // Set up timers for the WSF scheduler.
-    //
-    WsfOsInit();
-    WsfTimerInit();
+void exactle_stack_init(void) {
+  wsfHandlerId_t handlerId;
+  uint16_t wsfBufMemLen;
+  //
+  // Set up timers for the WSF scheduler.
+  //
+  WsfOsInit();
+  WsfTimerInit();
 
-    //
-    // Initialize a buffer pool for WSF dynamic memory needs.
-    //
-    wsfBufMemLen = WsfBufInit(sizeof(g_pui32BufMem), (uint8_t *)g_pui32BufMem, WSF_BUF_POOLS,
-               g_psPoolDescriptors);
+  //
+  // Initialize a buffer pool for WSF dynamic memory needs.
+  //
+  wsfBufMemLen = WsfBufInit(sizeof(g_pui32BufMem), (uint8_t *)g_pui32BufMem,
+                            WSF_BUF_POOLS, g_psPoolDescriptors);
 
-    if (wsfBufMemLen > sizeof(g_pui32BufMem))
-    {
-        am_util_debug_printf("Memory pool is too small by %d\r\n",
-                             wsfBufMemLen - sizeof(g_pui32BufMem));
-    }
+  if (wsfBufMemLen > sizeof(g_pui32BufMem)) {
+    am_util_debug_printf("Memory pool is too small by %d\r\n",
+                         wsfBufMemLen - sizeof(g_pui32BufMem));
+  }
 
-    //
-    // Initialize the WSF security service.
-    //
-    SecInit();
-    SecAesInit();
-    SecCmacInit();
-    SecEccInit();
+  //
+  // Initialize the WSF security service.
+  //
+  SecInit();
+  SecAesInit();
+  SecCmacInit();
+  SecEccInit();
 
-    //
-    // Set up callback functions for the various layers of the ExactLE stack.
-    //
-    handlerId = WsfOsSetNextHandler(HciHandler);
-    HciHandlerInit(handlerId);
+  //
+  // Set up callback functions for the various layers of the ExactLE stack.
+  //
+  handlerId = WsfOsSetNextHandler(HciHandler);
+  HciHandlerInit(handlerId);
 
-    handlerId = WsfOsSetNextHandler(DmHandler);
-    DmDevVsInit(0);
-    DmAdvInit();
-    DmPhyInit();
-    DmConnInit();
-    DmConnSlaveInit();
-    DmSecInit();
-    DmSecLescInit();
-    DmPrivInit();
-    DmHandlerInit(handlerId);
+  handlerId = WsfOsSetNextHandler(DmHandler);
+  DmDevVsInit(0);
+  DmAdvInit();
+  DmPhyInit();
+  DmConnInit();
+  DmConnSlaveInit();
+  DmSecInit();
+  DmSecLescInit();
+  DmPrivInit();
+  DmHandlerInit(handlerId);
 
-    handlerId = WsfOsSetNextHandler(L2cSlaveHandler);
-    L2cSlaveHandlerInit(handlerId);
-    L2cInit();
-    L2cSlaveInit();
+  handlerId = WsfOsSetNextHandler(L2cSlaveHandler);
+  L2cSlaveHandlerInit(handlerId);
+  L2cInit();
+  L2cSlaveInit();
 
-    handlerId = WsfOsSetNextHandler(AttHandler);
-    AttHandlerInit(handlerId);
-    AttsInit();
-    AttsIndInit();
-    AttcInit();
+  handlerId = WsfOsSetNextHandler(AttHandler);
+  AttHandlerInit(handlerId);
+  AttsInit();
+  AttsIndInit();
+  AttcInit();
 
-    handlerId = WsfOsSetNextHandler(SmpHandler);
-    SmpHandlerInit(handlerId);
-    SmprInit();
-    SmprScInit();
-    HciSetMaxRxAclLen(251);
+  handlerId = WsfOsSetNextHandler(SmpHandler);
+  SmpHandlerInit(handlerId);
+  SmprInit();
+  SmprScInit();
+  HciSetMaxRxAclLen(251);
 
-    handlerId = WsfOsSetNextHandler(AppHandler);
-    AppHandlerInit(handlerId);
+  handlerId = WsfOsSetNextHandler(AppHandler);
+  AppHandlerInit(handlerId);
 
-    handlerId = WsfOsSetNextHandler(FitHandler);
-    FitHandlerInit(handlerId);
+  handlerId = WsfOsSetNextHandler(FitHandler);
+  FitHandlerInit(handlerId);
 
-    handlerId = WsfOsSetNextHandler(HciDrvHandler);
-    HciDrvHandlerInit(handlerId);
+  handlerId = WsfOsSetNextHandler(HciDrvHandler);
+  HciDrvHandlerInit(handlerId);
 }
 
 //*****************************************************************************
@@ -226,14 +220,12 @@ exactle_stack_init(void)
 // GPIO interrupt handler.
 //
 //*****************************************************************************
-void
-am_cooper_irq_isr(void)
-{
-    uint32_t    ui32IntStatus;
+void am_cooper_irq_isr(void) {
+  uint32_t ui32IntStatus;
 
-    am_hal_gpio_interrupt_irq_status_get(AM_COOPER_IRQn, false, &ui32IntStatus);
-    am_hal_gpio_interrupt_irq_clear(AM_COOPER_IRQn, ui32IntStatus);
-    am_hal_gpio_interrupt_service(AM_COOPER_IRQn, ui32IntStatus);
+  am_hal_gpio_interrupt_irq_status_get(AM_COOPER_IRQn, false, &ui32IntStatus);
+  am_hal_gpio_interrupt_irq_clear(AM_COOPER_IRQn, ui32IntStatus);
+  am_hal_gpio_interrupt_service(AM_COOPER_IRQn, ui32IntStatus);
 }
 
 //*****************************************************************************
@@ -241,17 +233,14 @@ am_cooper_irq_isr(void)
 // UART interrupt handler.
 //
 //*****************************************************************************
-void
-am_uart_isr(void)
-{
-    uint32_t ui32Status;
+void am_uart_isr(void) {
+  uint32_t ui32Status;
 
-    //
-    // Read and save the interrupt status, but clear out the status register.
-    //
-    ui32Status = UARTn(0)->MIS;
-    UARTn(0)->IEC = ui32Status;
-
+  //
+  // Read and save the interrupt status, but clear out the status register.
+  //
+  ui32Status = UARTn(0)->MIS;
+  UARTn(0)->IEC = ui32Status;
 }
 
 //*****************************************************************************
@@ -259,13 +248,11 @@ am_uart_isr(void)
 // Perform initial setup for the radio task.
 //
 //*****************************************************************************
-void
-RadioTaskSetup(void)
-{
-    am_util_debug_printf("RadioTask: setup\r\n");
+void RadioTaskSetup(void) {
+  am_util_debug_printf("RadioTask: setup\r\n");
 
-    NVIC_SetPriority(COOPER_IOM_IRQn, NVIC_configMAX_SYSCALL_INTERRUPT_PRIORITY);
-    NVIC_SetPriority(AM_COOPER_IRQn, NVIC_configMAX_SYSCALL_INTERRUPT_PRIORITY);
+  NVIC_SetPriority(COOPER_IOM_IRQn, NVIC_configMAX_SYSCALL_INTERRUPT_PRIORITY);
+  NVIC_SetPriority(AM_COOPER_IRQn, NVIC_configMAX_SYSCALL_INTERRUPT_PRIORITY);
 }
 
 //*****************************************************************************
@@ -273,46 +260,43 @@ RadioTaskSetup(void)
 // Short Description.
 //
 //*****************************************************************************
-void
-RadioTask(void *pvParameters)
-{
+void RadioTask(void *pvParameters) {
 #if WSF_TRACE_ENABLED == TRUE
-    //
-    // Enable ITM
-    //
-    am_util_debug_printf("Starting wicentric trace:\n\n");
+  //
+  // Enable ITM
+  //
+  am_util_debug_printf("Starting wicentric trace:\n\n");
 #endif
 
-    //
-    // Boot the radio.
-    //
-    HciDrvRadioBoot(1);
+  //
+  // Boot the radio.
+  //
+  HciDrvRadioBoot(1);
 
+  //
+  // Initialize the main ExactLE stack.
+  //
+  exactle_stack_init();
+
+  // uncomment the following to set custom Bluetooth address here
+  // {
+  //     uint8_t bd_addr[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+  //     HciVscSetCustom_BDAddr(&bd_addr[0]);
+  // }
+
+  //
+  // Start the "Fit" profile.
+  //
+  HelloJsonSvcAdd();
+  HelloJsonRegisterConnCallback(DM_CLIENT_ID_APP + 1);
+
+  FitStart();
+
+  while (1) {
     //
-    // Initialize the main ExactLE stack.
+    // Calculate the elapsed time from our free-running timer, and update
+    // the software timers in the WSF scheduler.
     //
-    exactle_stack_init();
-
-    // uncomment the following to set custom Bluetooth address here
-    // {
-    //     uint8_t bd_addr[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
-    //     HciVscSetCustom_BDAddr(&bd_addr[0]);
-    // }
-
-    //
-    // Start the "Fit" profile.
-    //
-    HelloJsonSvcAdd();
-
-    FitStart();
-
-    while (1)
-    {
-        //
-        // Calculate the elapsed time from our free-running timer, and update
-        // the software timers in the WSF scheduler.
-        //
-        wsfOsDispatcher();
-
-    }
+    wsfOsDispatcher();
+  }
 }
