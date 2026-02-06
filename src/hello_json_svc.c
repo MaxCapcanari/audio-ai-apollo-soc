@@ -15,8 +15,13 @@
 #define HELLO_CCC_HDL        (HELLO_SVC_START_HDL + 3)
 #define HELLO_SVC_END_HDL    (HELLO_SVC_START_HDL + 3)
 
-#define HELLO_CCC_OFFSET   16
+#define HELLO_CCC_OFFSET   0
 #define HELLO_CCC_TBL_LEN  (HELLO_CCC_OFFSET + 1)
+
+static attsCccSet_t helloCccSet[] =
+{
+  { HELLO_CCC_HDL, ATT_CLIENT_CFG_NOTIFY, HELLO_CCC_OFFSET }
+};
 
 static const uint8_t helloSvcUuid[ATT_128_UUID_LEN] =
 {
@@ -82,12 +87,6 @@ static attsAttr_t helloSvcList[] =
     (ATTS_PERMIT_READ | ATTS_PERMIT_WRITE)
   }
 };
-
-static attsCccSet_t helloCccSet[] =
-{
-  { HELLO_CCC_HDL, ATT_CLIENT_CFG_NOTIFY, 16 }
-};
-
 
 
 static uint16_t helloCccTbl[HELLO_CCC_TBL_LEN] = { 0 };

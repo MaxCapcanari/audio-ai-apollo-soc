@@ -90,8 +90,7 @@
 // Includes for the ExactLE "fit" profile.
 //
 //*****************************************************************************
-#include "app_ui.h"
-#include "fit_api.h"
+#include "hello_app.h"
 
 //*****************************************************************************
 //
@@ -108,6 +107,7 @@ TaskHandle_t radio_task_handle;
 void exactle_stack_init(void);
 void HelloJsonSvcAdd(void);
 void HelloJsonRegisterConnCallback(uint8_t clientId);
+
 //*****************************************************************************
 //
 // WSF buffer pools.
@@ -208,8 +208,8 @@ void exactle_stack_init(void) {
   handlerId = WsfOsSetNextHandler(AppHandler);
   AppHandlerInit(handlerId);
 
-  handlerId = WsfOsSetNextHandler(FitHandler);
-  FitHandlerInit(handlerId);
+  handlerId = WsfOsSetNextHandler(HelloAppHandler);
+  HelloAppHandlerInit(handlerId);
 
   handlerId = WsfOsSetNextHandler(HciDrvHandler);
   HciDrvHandlerInit(handlerId);
@@ -277,6 +277,7 @@ void RadioTask(void *pvParameters) {
   // Initialize the main ExactLE stack.
   //
   exactle_stack_init();
+  am_util_debug_printf("RADIO: stack init done\r\n");
 
   // uncomment the following to set custom Bluetooth address here
   // {
@@ -290,7 +291,10 @@ void RadioTask(void *pvParameters) {
   HelloJsonSvcAdd();
   HelloJsonRegisterConnCallback(DM_CLIENT_ID_APP + 1);
 
-  FitStart();
+am_util_debug_printf("RADIO: about to call HelloAppStart()\r\n");
+HelloAppStart();
+am_util_debug_printf("RADIO: returned from HelloAppStart()\r\n");
+
 
   while (1) {
     //
