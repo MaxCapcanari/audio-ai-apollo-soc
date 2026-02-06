@@ -10,13 +10,12 @@
 
 #include "am_util.h"
 
-#define HELLO_SVC_START_HDL  0x0800
+#define HELLO_SVC_START_HDL  0x9000
 #define HELLO_VAL_HDL        (HELLO_SVC_START_HDL + 2)
 #define HELLO_CCC_HDL        (HELLO_SVC_START_HDL + 3)
 #define HELLO_SVC_END_HDL    (HELLO_SVC_START_HDL + 3)
 
-#define HELLO_CCC_OFFSET   16
-#define HELLO_CCC_TBL_LEN  (HELLO_CCC_OFFSET + 1)
+static bool_t g_helloGroupAdded = FALSE;
 
 static const uint8_t helloSvcUuid[ATT_128_UUID_LEN] =
 {
@@ -83,16 +82,6 @@ static attsAttr_t helloSvcList[] =
   }
 };
 
-static attsCccSet_t helloCccSet[] =
-{
-  { HELLO_CCC_HDL, ATT_CLIENT_CFG_NOTIFY, 16 }
-};
-
-
-
-static uint16_t helloCccTbl[HELLO_CCC_TBL_LEN] = { 0 };
-
-
 static attsGroup_t helloSvcGroup =
 {
   NULL,
@@ -139,57 +128,56 @@ static void helloNotify(void)
   AttsHandleValueNtf(g_connId, HELLO_VAL_HDL, helloValLen, helloValBuf);
 }
 
-static void helloCccCback(attsCccEvt_t *pEvt)
-{
-  if (pEvt->handle != HELLO_CCC_HDL) return;
-
-  g_connId = (dmConnId_t)pEvt->hdr.param;
-  g_notifyEnabled = (pEvt->value == ATT_CLIENT_CFG_NOTIFY) ? TRUE : FALSE;
-
-  if (g_notifyEnabled)
-  {
-    helloSetJsonWithUptime("Apollo4");
-    am_util_debug_printf("HelloJson: notifications enabled, sending initial: %s\r\n", (char *)helloValBuf);
-    helloNotify();
-  }
-  else
-  {
-    am_util_debug_printf("HelloJson: notifications disabled\r\n");
-  }
-}
-
-static void helloDmCback(dmEvt_t *pEvt)
-{
-  switch (pEvt->hdr.event)
-  {
-    case DM_CONN_OPEN_IND:
-      g_connId = (dmConnId_t)pEvt->hdr.param;
-      AttsCccInitTable(g_connId, helloCccTbl);
-      break;
-
-    case DM_CONN_CLOSE_IND:
-      g_connId = DM_CONN_ID_NONE;
-      g_notifyEnabled = FALSE;
-      break;
-
-    default:
-      break;
-  }
-}
-
 void HelloJsonSvcAdd(void)
 {
-  memcpy(&helloChDecl[3], helloValUuid, ATT_128_UUID_LEN);
+  if (g_helloGroupAdded)
+  {
+    return;
+  }
+  g_helloGroupAdded = TRUE;
 
-  helloSetJsonWithUptime("Apollo4");
+  memcpy(&helloChDecl[3], helloValUuid, ATT_128_UUID_LEN);
 
   AttsAddGroup(&helloSvcGroup);
 
-  AttsCccRegister((uint8_t)(sizeof(helloCccSet) / sizeof(helloCccSet[0])),
-                  helloCccSet,
-                  helloCccCback);
+  helloSetJsonWithUptime("Apollo4");
 }
 
+
+
+void HelloJsonCccState(dmConnId_t connId, bool_t enabled)
+{
+  /* Ignore CCC changes for other connections */
+  if ((g_connId != DM_CONN_ID_NONE) && (connId != g_connId))
+  {
+    return;
+  }
+
+  g_connId = connId;
+  g_notifyEnabled = enabled;
+
+  if (enabled)
+  {
+    am_util_debug_printf("HelloJson: notify enabled (connId=%d)\r\n", connId);
+
+    /* Prepare value, but DO NOT notify here */
+    helloSetJsonWithUptime("Apollo4");
+  }
+  else
+  {
+    am_util_debug_printf("HelloJson: notify disabled (connId=%d)\r\n", connId);
+  }
+}
+
+
+void HelloJsonConnClose(dmConnId_t connId)
+{
+  if (g_connId == connId)
+  {
+    g_connId = DM_CONN_ID_NONE;
+    g_notifyEnabled = FALSE;
+  }
+}
 
 void HelloJsonOnButton0Pressed(void)
 {
@@ -197,10 +185,3 @@ void HelloJsonOnButton0Pressed(void)
   am_util_debug_printf("Sending message: %s\r\n", (char *)helloValBuf);
   helloNotify();
 }
-
-void HelloJsonRegisterConnCallback(uint8_t clientId)
-{
-  DmConnRegister(clientId, helloDmCback);
-}
-
-

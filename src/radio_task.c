@@ -107,13 +107,12 @@ TaskHandle_t radio_task_handle;
 //*****************************************************************************
 void exactle_stack_init(void);
 void HelloJsonSvcAdd(void);
-void HelloJsonRegisterConnCallback(uint8_t clientId);
 //*****************************************************************************
 //
 // WSF buffer pools.
 //
 //*****************************************************************************
-#define WSF_BUF_POOLS 4
+#define WSF_BUF_POOLS 5
 
 // Important note: the size of g_pui32BufMem should includes both overhead of
 // internal buffer management structure, wsfBufPool_t (up to 16 bytes for each
@@ -123,12 +122,14 @@ void HelloJsonRegisterConnCallback(uint8_t clientId);
 
 // Memory for the buffer pool
 // extra AMOTA_PACKET_SIZE bytes for OTA handling
-static uint32_t
-    g_pui32BufMem[(WSF_BUF_POOLS * 16 + 16 * 8 + 32 * 4 + 64 * 6 + 280 * 14) /
-                  sizeof(uint32_t)];
+static uint32_t g_pui32BufMem[
+    (WSF_BUF_POOLS * 16 + 16 * 8 + 32 * 4 + 64 * 6 + 280 * 14 + 288 * 4) /
+    sizeof(uint32_t)];
+
 // Default pool descriptor.
 static wsfBufPoolDesc_t g_psPoolDescriptors[WSF_BUF_POOLS] = {
-    {16, 8}, {32, 4}, {64, 6}, {280, 14}};
+    {16, 8}, {32, 4}, {64, 6}, {280, 14}, {288, 4}};
+
 
 //*****************************************************************************
 //
@@ -283,12 +284,6 @@ void RadioTask(void *pvParameters) {
   //     uint8_t bd_addr[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
   //     HciVscSetCustom_BDAddr(&bd_addr[0]);
   // }
-
-  //
-  // Start the "Fit" profile.
-  //
-  HelloJsonSvcAdd();
-  HelloJsonRegisterConnCallback(DM_CLIENT_ID_APP + 1);
 
   FitStart();
 
