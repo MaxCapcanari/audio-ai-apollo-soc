@@ -31,7 +31,7 @@ static const uint8_t helloValUuid[ATT_128_UUID_LEN] =
 
 static uint8_t helloChDecl[1 + 2 + ATT_128_UUID_LEN] =
 {
-  (ATT_PROP_READ | ATT_PROP_NOTIFY),
+  (ATT_PROP_READ | ATT_PROP_WRITE | ATT_PROP_NOTIFY),
   (uint8_t)(HELLO_VAL_HDL & 0xFF),
   (uint8_t)((HELLO_VAL_HDL >> 8) & 0xFF),
   0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
@@ -45,6 +45,11 @@ static uint16_t helloValLen = 0;
 
 static uint8_t  helloCccVal[2] = { 0x00, 0x00 };
 static uint16_t helloCccLen = sizeof(helloCccVal);
+
+static uint8_t helloWriteCback(dmConnId_t connId, uint16_t handle,
+                               uint8_t operation, uint16_t offset,
+                               uint16_t len, uint8_t *pValue,
+                               attsAttr_t *pAttr);
 
 static attsAttr_t helloSvcList[] =
 {
@@ -69,8 +74,8 @@ static attsAttr_t helloSvcList[] =
     helloValBuf,
     &helloValLen,
     sizeof(helloValBuf),
-    0,
-    ATTS_PERMIT_READ
+    (ATTS_SET_VARIABLE_LEN | ATTS_SET_WRITE_CBACK),
+    (ATTS_PERMIT_READ | ATTS_PERMIT_WRITE)
   },
   {
     (uint8_t *)attCliChCfgUuid,
@@ -87,7 +92,7 @@ static attsGroup_t helloSvcGroup =
   NULL,
   helloSvcList,
   NULL,
-  NULL,
+  helloWriteCback,
   HELLO_SVC_START_HDL,
   HELLO_SVC_END_HDL
 };
@@ -95,22 +100,91 @@ static attsGroup_t helloSvcGroup =
 static dmConnId_t g_connId = DM_CONN_ID_NONE;
 static bool_t     g_notifyEnabled = FALSE;
 
-static void helloSetJsonWithUptime(const char *deviceName)
+static bool_t helloLooksLikeJsonObject(const char *pStr, uint16_t len)
 {
-  uint32_t ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+  uint16_t start = 0;
+  int end = (int)len - 1;
 
-  uint32_t totalSeconds = ms / 1000U;
-  uint32_t hours   = totalSeconds / 3600U;
-  uint32_t minutes = (totalSeconds % 3600U) / 60U;
-  uint32_t seconds = totalSeconds % 60U;
+  while ((start < len) &&
+         ((pStr[start] == ' ') || (pStr[start] == '\r') ||
+          (pStr[start] == '\n') || (pStr[start] == '\t')))
+  {
+    start++;
+  }
 
+  while ((end >= 0) &&
+         ((pStr[end] == ' ') || (pStr[end] == '\r') ||
+          (pStr[end] == '\n') || (pStr[end] == '\t')))
+  {
+    end--;
+  }
+
+  if (start >= len)
+  {
+    return FALSE;
+  }
+
+  if (end < 0)
+  {
+    return FALSE;
+  }
+
+  return (pStr[start] == '{') && (pStr[end] == '}');
+}
+
+static void helloSetJsonAckPong(void)
+{
   int n = snprintf((char *)helloValBuf,
                    sizeof(helloValBuf),
-                   "{\"device\":\"%s\",\"message\":\"hello\",\"uptime\":\"%02lu:%02lu:%02lu\"}",
-                   deviceName,
-                   (unsigned long)hours,
-                   (unsigned long)minutes,
-                   (unsigned long)seconds);
+                   "{\"device\":\"Apollo4\",\"status\":\"ok\",\"reply\":\"pong\"}");
+
+  if ((n < 0) || ((size_t)n >= sizeof(helloValBuf)))
+  {
+    return;
+  }
+
+  helloValLen = (uint16_t)n;
+  AttsSetAttr(HELLO_VAL_HDL, helloValLen, helloValBuf);
+}
+
+static void helloSetJsonAckLen(uint16_t len)
+{
+  int n = snprintf((char *)helloValBuf,
+                   sizeof(helloValBuf),
+                   "{\"device\":\"Apollo4\",\"status\":\"ok\",\"received_len\":%u}",
+                   (unsigned)len);
+
+  if ((n < 0) || ((size_t)n >= sizeof(helloValBuf)))
+  {
+    return;
+  }
+
+  helloValLen = (uint16_t)n;
+  AttsSetAttr(HELLO_VAL_HDL, helloValLen, helloValBuf);
+}
+
+static void helloSetJsonError(const char *reason)
+{
+  int n = snprintf((char *)helloValBuf,
+                   sizeof(helloValBuf),
+                   "{\"device\":\"Apollo4\",\"status\":\"error\",\"reason\":\"%s\"}",
+                   reason);
+
+  if ((n < 0) || ((size_t)n >= sizeof(helloValBuf)))
+  {
+    return;
+  }
+
+  helloValLen = (uint16_t)n;
+  AttsSetAttr(HELLO_VAL_HDL, helloValLen, helloValBuf);
+}
+
+static void helloSetJsonHello(const char *deviceName)
+{
+  int n = snprintf((char *)helloValBuf,
+                   sizeof(helloValBuf),
+                   "{\"device\":\"%s\",\"message\":\"hello\"}",
+                   deviceName);
 
   if (n < 0) return;
   if ((size_t)n >= sizeof(helloValBuf)) return;
@@ -128,6 +202,58 @@ static void helloNotify(void)
   AttsHandleValueNtf(g_connId, HELLO_VAL_HDL, helloValLen, helloValBuf);
 }
 
+static uint8_t helloWriteCback(dmConnId_t connId, uint16_t handle,
+                               uint8_t operation, uint16_t offset,
+                               uint16_t len, uint8_t *pValue,
+                               attsAttr_t *pAttr)
+{
+  char rxBuf[sizeof(helloValBuf)];
+
+  (void)operation;
+  (void)pAttr;
+
+  if (handle != HELLO_VAL_HDL)
+  {
+    return ATT_SUCCESS;
+  }
+
+  if (offset != 0)
+  {
+    return ATT_ERR_OFFSET;
+  }
+
+  if ((len == 0) || (len >= sizeof(rxBuf)))
+  {
+    return ATT_ERR_LENGTH;
+  }
+
+  memcpy(rxBuf, pValue, len);
+  rxBuf[len] = '\0';
+
+  g_connId = connId;
+
+  am_util_debug_printf("HelloJson RX (%u bytes): %s\r\n", (unsigned)len, rxBuf);
+
+  if (!helloLooksLikeJsonObject(rxBuf, len))
+  {
+    helloSetJsonError("invalid_json");
+    helloNotify();
+    return ATT_SUCCESS;
+  }
+
+  if ((strstr(rxBuf, "\"cmd\"") != NULL) && (strstr(rxBuf, "\"ping\"") != NULL))
+  {
+    helloSetJsonAckPong();
+  }
+  else
+  {
+    helloSetJsonAckLen(len);
+  }
+
+  helloNotify();
+  return ATT_SUCCESS;
+}
+
 void HelloJsonSvcAdd(void)
 {
   if (g_helloGroupAdded)
@@ -140,7 +266,7 @@ void HelloJsonSvcAdd(void)
 
   AttsAddGroup(&helloSvcGroup);
 
-  helloSetJsonWithUptime("Apollo4");
+  helloSetJsonHello("Apollo4");
 }
 
 
@@ -161,7 +287,7 @@ void HelloJsonCccState(dmConnId_t connId, bool_t enabled)
     am_util_debug_printf("HelloJson: notify enabled (connId=%d)\r\n", connId);
 
     /* Prepare value, but DO NOT notify here */
-    helloSetJsonWithUptime("Apollo4");
+    helloSetJsonHello("Apollo4");
   }
   else
   {
@@ -181,7 +307,7 @@ void HelloJsonConnClose(dmConnId_t connId)
 
 void HelloJsonOnButton0Pressed(void)
 {
-  helloSetJsonWithUptime("Apollo4");
+  helloSetJsonHello("Apollo4");
   am_util_debug_printf("Sending message: %s\r\n", (char *)helloValBuf);
   helloNotify();
 }
