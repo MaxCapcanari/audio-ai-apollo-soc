@@ -69,6 +69,7 @@
 //*****************************************************************************
 #include "ble_freertos_fit.h"
 #include "rtos.h"
+#include "fake_opus_audio.h"
 
 //*****************************************************************************
 //
@@ -130,6 +131,11 @@ main(void)
     am_util_debug_printf("FreeRTOS Fit ------- Example\n");
 
     //
+    // Generate temporary fake Opus payload for BLE integration work.
+    //
+    FakeOpusAudioInit();
+
+    //
     // Run the application.
     //
     run_tasks();
@@ -142,4 +148,3 @@ main(void)
     }
 
 }
-

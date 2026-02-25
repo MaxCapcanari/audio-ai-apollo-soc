@@ -221,7 +221,9 @@ SRC += hci_vs_cooper.c
 SRC += am_resources.c
 SRC += ble_freertos_fit.c
 SRC += radio_task.c
-SRC += hello_json_svc.c
+SRC += ble_json_svc.c
+SRC += ble_opus_stream_svc.c
+SRC += fake_opus_audio.c
 SRC += rtos.c
 SRC += hid_main.c
 SRC += smpi_act.c
@@ -418,4 +420,3 @@ $(CONFIG)/%.d: ;
 -include $(DEPS)
 endif
 .PHONY: all clean directories
-

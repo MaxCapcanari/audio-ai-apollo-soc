@@ -152,6 +152,8 @@ SRCS += ../../../../../../third_party/cordio/ble-host/sources/hci/ambiq/cooper/h
 SRCS += ../src/am_resources.c
 SRCS += ../src/ble_freertos_fit.c
 SRCS += ../src/radio_task.c
+SRCS += ../src/ble_opus_stream_svc.c
+SRCS += ../src/fake_opus_audio.c
 SRCS += ../src/rtos.c
 SRCS += ../../../../../../third_party/cordio/ble-profiles/sources/profiles/hid/hid_main.c
 SRCS += ../../../../../../third_party/cordio/ble-host/sources/stack/smp/smpi_act.c
@@ -289,4 +291,3 @@ clean:
 
 endif
 .PHONY: all clean directories
-

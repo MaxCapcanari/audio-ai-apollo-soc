@@ -47,3 +47,14 @@ SWROOT?=../../../../..
 
 # Include rules for building generic examples.
 include $(SWROOT)/makedefs/example.mk
+
+.PHONY: vendor-patch-check vendor-patch-apply vendor-patch-revert
+
+vendor-patch-check:
+	@./scripts/apply_vendor_patches.sh --check
+
+vendor-patch-apply:
+	@./scripts/apply_vendor_patches.sh
+
+vendor-patch-revert:
+	@./scripts/apply_vendor_patches.sh --reverse

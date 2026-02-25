@@ -1,0 +1,180 @@
+--- third_party/cordio/ble-profiles/sources/apps/fit/fit_main.c
++++ third_party/cordio/ble-profiles/sources/apps/fit/fit_main.c
+@@ -60,11 +60,31 @@
+ /* Default Running Speed and Cadence Measurement period (seconds) */
+ #define FIT_DEFAULT_RSCM_PERIOD 1
+ 
++/* Hello JSON service handle + CCC (must match ble_json_svc.c) */
++#define HELLO_SVC_START_HDL  0x9000
++#define HELLO_CCC_HDL (HELLO_SVC_START_HDL + 3)
++
++/* Opus stream service handle + CCC (must match ble_opus_stream_svc.c) */
++#define OPUS_SVC_START_HDL  0x9010
++#define OPUS_CCC_HDL (OPUS_SVC_START_HDL + 3)
++#define FIT_OPUS_STREAM_PERIOD_MS 20U
++
++/* Hello JSON service hooks implemented in ble_json_svc.c */
++void HelloJsonSvcAdd(void);
++void HelloJsonCccState(dmConnId_t connId, bool_t enabled);
++void HelloJsonConnClose(dmConnId_t connId);
++void OpusStreamSvcAdd(void);
++void OpusStreamCccState(dmConnId_t connId, bool_t enabled);
++void OpusStreamConnClose(dmConnId_t connId);
++bool_t OpusStreamSendNextChunk(void);
++void OpusStreamSetMtu(uint16_t mtu);
++
+ /*! WSF message event enumeration */
+ enum {
+   FIT_HR_TIMER_IND = FIT_MSG_START, /*! Heart rate measurement timer expired */
+   FIT_BATT_TIMER_IND,               /*! Battery measurement timer expired */
+   FIT_RUNNING_TIMER_IND, /*! Running speed and cadence measurement timer expired */
++  FIT_OPUS_TIMER_IND
+ };
+ 
+ /**************************************************************************************************
+@@ -192,6 +212,8 @@
+   FIT_BATT_LVL_CCC_IDX, /*! Battery service, battery level characteristic */
+   FIT_RSCS_SM_CCC_IDX,  /*! Runninc speed and cadence measurement characteristic
+                          */
++  FIT_HELLO_JSON_CCC_IDX,
++  FIT_OPUS_STREAM_CCC_IDX,
+   FIT_NUM_CCC_IDX
+ };
+ 
+@@ -207,6 +229,8 @@
+      DM_SEC_LEVEL_NONE}, /* FIT_BATT_LVL_CCC_IDX */
+     {RSCS_RSM_CH_CCC_HDL, ATT_CLIENT_CFG_NOTIFY,
+      DM_SEC_LEVEL_NONE}, /* FIT_RSCS_SM_CCC_IDX */
++    {HELLO_CCC_HDL, ATT_CLIENT_CFG_NOTIFY, DM_SEC_LEVEL_NONE},
++    {OPUS_CCC_HDL, ATT_CLIENT_CFG_NOTIFY, DM_SEC_LEVEL_NONE}};
+ 
+ /**************************************************************************************************
+   Global Variables
+@@ -217,6 +241,7 @@
+ 
+ /* WSF Timer to send running speed and cadence measurement data */
+ wsfTimer_t fitRscmTimer;
++wsfTimer_t fitOpusTimer;
+ 
+ /* Running Speed and Cadence Measurement period - Can be changed at runtime to
+  * vary period */
+@@ -225,6 +250,21 @@
+ /* Heart Rate Monitor feature flags */
+ static uint8_t fitHrmFlags = CH_HRM_FLAGS_VALUE_8BIT | CH_HRM_FLAGS_ENERGY_EXP;
+ 
++static void fitSendOpusChunk(dmConnId_t connId) {
++  bool_t hasMore;
++
++  hasMore = OpusStreamSendNextChunk();
++  if (hasMore) {
++    fitOpusTimer.msg.event = FIT_OPUS_TIMER_IND;
++    fitOpusTimer.msg.status = FIT_OPUS_STREAM_CCC_IDX;
++    fitOpusTimer.handlerId = fitHandlerId;
++    fitOpusTimer.msg.param = connId;
++    WsfTimerStartMs(&fitOpusTimer, FIT_OPUS_STREAM_PERIOD_MS);
++  } else {
++    WsfTimerStop(&fitOpusTimer);
++  }
++}
++
+ /*************************************************************************************************/
+ /*!
+  *  \brief  Application DM callback.
+@@ -375,6 +415,28 @@
+     }
+     return;
+   }
++
++  /* handle hello json CCC */
++  if (pMsg->ccc.idx == FIT_HELLO_JSON_CCC_IDX) {
++    if (pMsg->ccc.value == ATT_CLIENT_CFG_NOTIFY) {
++      HelloJsonCccState((dmConnId_t)pMsg->ccc.hdr.param, TRUE);
++    } else {
++      HelloJsonCccState((dmConnId_t)pMsg->ccc.hdr.param, FALSE);
++    }
++    return;
++  }
++
++  /* handle opus stream CCC */
++  if (pMsg->ccc.idx == FIT_OPUS_STREAM_CCC_IDX) {
++    if (pMsg->ccc.value == ATT_CLIENT_CFG_NOTIFY) {
++      OpusStreamCccState((dmConnId_t)pMsg->ccc.hdr.param, TRUE);
++      fitSendOpusChunk((dmConnId_t)pMsg->ccc.hdr.param);
++    } else {
++      OpusStreamCccState((dmConnId_t)pMsg->ccc.hdr.param, FALSE);
++      WsfTimerStop(&fitOpusTimer);
++    }
++    return;
++  }
+ }
+ 
+ /*************************************************************************************************/
+@@ -395,7 +457,10 @@
+ 
+   /* Stop running speed and cadence timer */
+   WsfTimerStop(&fitRscmTimer);
++  WsfTimerStop(&fitOpusTimer);
+ 
++  HelloJsonConnClose((dmConnId_t)pMsg->hdr.param);
++  OpusStreamConnClose((dmConnId_t)pMsg->hdr.param);
+ }
+ 
+ /*************************************************************************************************/
+@@ -552,6 +617,10 @@
+     fitSendRunningSpeedMeasurement((dmConnId_t)pMsg->ccc.hdr.param);
+     break;
+ 
++  case FIT_OPUS_TIMER_IND:
++    fitSendOpusChunk((dmConnId_t)pMsg->ccc.hdr.param);
++    break;
++
+   case FIT_HR_TIMER_IND:
+     HrpsProcMsg(&pMsg->hdr);
+     break;
+@@ -569,6 +638,11 @@
+     fitProcCccState(pMsg);
+     break;
+ 
++  case ATT_MTU_UPDATE_IND:
++    APP_TRACE_INFO1("Negotiated MTU %d", ((attEvt_t *)pMsg)->mtu);
++    OpusStreamSetMtu(((attEvt_t *)pMsg)->mtu);
++    break;
++
+   case DM_RESET_CMPL_IND:
+     am_util_debug_printf("DM_RESET_CMPL_IND\r\n");
+ 
+@@ -607,6 +681,7 @@
+   case DM_CONN_OPEN_IND:
+     am_util_debug_printf("DM_CONN_OPEN_IND\r\n");
+ 
++    OpusStreamSetMtu(23);
+     HrpsProcMsg(&pMsg->hdr);
+     BasProcMsg(&pMsg->hdr);
+     // AppSlaveSecurityReq(1);
+@@ -785,6 +860,17 @@
+   AttRegister(fitAttCback);
+   AttConnRegister(AppServerConnCback);
+   AttsCccRegister(FIT_NUM_CCC_IDX, (attsCccSet_t *)fitCccSet, fitCccCback);
++  am_util_debug_printf("CCC table:\r\n");
++  for (uint8_t i = 0; i < FIT_NUM_CCC_IDX; i++) {
++    am_util_debug_printf("  idx=%d handle=%u (0x%04X)\r\n", i,
++                         (unsigned)fitCccSet[i].handle,
++                         (unsigned)fitCccSet[i].handle);
++  }
++  am_util_debug_printf("HELLO_CCC_HDL=%u (0x%04X)\r\n", (unsigned)HELLO_CCC_HDL,
++                       (unsigned)HELLO_CCC_HDL);
++  am_util_debug_printf("OPUS_CCC_HDL=%u (0x%04X)\r\n", (unsigned)OPUS_CCC_HDL,
++                       (unsigned)OPUS_CCC_HDL);
++
+   /* Register for app framework callbacks */
+   AppUiBtnRegister(fitBtnCback);
+ 
+@@ -797,6 +883,8 @@
+   SvcBattCbackRegister(BasReadCback, NULL);
+   SvcBattAddGroup();
+   SvcRscsAddGroup();
++  HelloJsonSvcAdd();
++  OpusStreamSvcAdd();
+ 
+   /* Set Service Changed CCCD index. */
+   GattSetSvcChangedIdx(FIT_GATT_SC_CCC_IDX);
