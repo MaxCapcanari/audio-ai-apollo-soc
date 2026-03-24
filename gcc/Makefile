@@ -224,6 +224,7 @@ SRC += radio_task.c
 SRC += ble_json_svc.c
 SRC += ble_opus_stream_svc.c
 SRC += fake_opus_audio.c
+SRC += mic_task.c
 SRC += rtos.c
 SRC += hid_main.c
 SRC += smpi_act.c

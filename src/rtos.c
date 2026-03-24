@@ -21,6 +21,7 @@
 #include "portmacro.h"
 #include "portable.h"
 #include "ble_freertos_fit.h"
+#include "mic_task.h"
 
 extern TaskHandle_t radio_task_handle;
 
@@ -102,7 +103,7 @@ am_timer_isr(void)
 //*****************************************************************************
 uint32_t am_freertos_sleep(uint32_t idleTime)
 {
-    am_hal_sysctrl_sleep(AM_HAL_SYSCTRL_SLEEP_DEEP);
+    am_hal_sysctrl_sleep(AM_HAL_SYSCTRL_SLEEP_NORMAL); // DEBUG: changed from SLEEP_DEEP so JLink can halt
     return 0;
 }
 
@@ -155,6 +156,8 @@ setup_task(void *pvParameters)
     xTaskCreate(RadioTask, "RadioTask", 512, 0, 3, &radio_task_handle);
 
     xTaskCreate(ButtonTask, "ButtonTask", 256, 0, 2, NULL);
+
+    xTaskCreate(MicTask, "MicTask", 512, 0, 2, NULL);
 
     vTaskSuspend(NULL);
 
