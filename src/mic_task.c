@@ -87,16 +87,25 @@ AM_SHARED_RW static int32_t g_recBuf[REC_SAMPLES];
 
 static void *g_pI2SHandle = NULL;
 
-typedef enum { MODE_IDLE, MODE_RECORDING, MODE_PLAYING } mic_mode_t;
+typedef enum { MODE_IDLE, MODE_RECORDING, MODE_PLAYING, MODE_TESTTONE } mic_mode_t;
 
 static volatile mic_mode_t g_mode     = MODE_IDLE;
 static volatile uint32_t   g_recPos   = 0;
 static volatile uint32_t   g_recLen   = 0;
 static volatile bool       g_nextPlay = false;
+static volatile int32_t    g_recDC    = 0;     // DC offset to subtract during playback
 
 // ISR -> task notification
 static volatile bool       g_recDone  = false;
 static volatile bool       g_playDone = false;
+
+// Test tone state (1 kHz square wave, 2 seconds)
+#define TONE_FREQ           1000
+#define TONE_HALF_PERIOD    (REC_SAMPLE_RATE / (TONE_FREQ * 2))  // ~11 samples
+#define TONE_AMPLITUDE      0x200000   // ~25% of 24-bit full scale
+#define TONE_DURATION       (REC_SAMPLE_RATE * 2)  // 2 seconds
+static volatile uint32_t   g_tonePos  = 0;
+static volatile bool       g_toneDone = false;
 
 // Raw DMA debug: even + odd channel words from start of each second
 static volatile uint32_t g_debugEven[4] = {0};
@@ -197,10 +206,20 @@ void am_dspi2s0_isr(void)
             // ---- TX output ----
             if (g_mode == MODE_PLAYING && g_recPos < g_recLen)
             {
-                int32_t s = g_recBuf[g_recPos++];
+                int32_t s = g_recBuf[g_recPos++] - g_recDC;
                 uint32_t tx = (uint32_t)((int32_t)(s >> PLAY_VOL_SHIFT)) & 0x00FFFFFF;
                 txBuf[i]     = tx;
                 txBuf[i + 1] = tx;
+            }
+            else if (g_mode == MODE_TESTTONE && g_tonePos < TONE_DURATION)
+            {
+                // 1 kHz square wave: positive half then negative half
+                int32_t val = ((g_tonePos / TONE_HALF_PERIOD) & 1)
+                              ? -TONE_AMPLITUDE : TONE_AMPLITUDE;
+                uint32_t tx = (uint32_t)(val) & 0x00FFFFFF;
+                txBuf[i]     = tx;
+                txBuf[i + 1] = tx;
+                g_tonePos++;
             }
             else
             {
@@ -224,6 +243,13 @@ void am_dspi2s0_isr(void)
             g_playDone = true;
         }
 
+        // Auto-stop test tone when done
+        if (g_mode == MODE_TESTTONE && g_tonePos >= TONE_DURATION)
+        {
+            g_mode     = MODE_IDLE;
+            g_toneDone = true;
+        }
+
         // Per-second stats
         g_secSumAbs += sumOdd;
         g_dmaBufCount++;
@@ -236,13 +262,6 @@ void am_dspi2s0_isr(void)
             g_dmaBufCount = 0;
             g_printReady  = 1;
         }
-    }
-    else if (ui32Status & AM_HAL_I2S_INT_TXDMACPL)
-    {
-        uint32_t *txBuf =
-            (uint32_t *)am_hal_i2s_dma_get_buffer(g_pI2SHandle, AM_HAL_I2S_XFER_TX);
-        for (uint32_t i = 0; i < MIC_DMA_SAMPLES; i++)
-            txBuf[i] = 0;
     }
 }
 
@@ -319,17 +338,18 @@ void MicTask(void *pvParameters)
     mic_i2s_init(rxPtrA, rxPtrB, txPtrA, txPtrB);
     am_hal_i2s_dma_transfer_start(g_pI2SHandle, &g_sI2SConfig);
 
-    am_util_stdio_printf("[mic] Ready. Press BUTTON1 (SW2) to record %d sec.\n", REC_SECONDS);
+    am_util_stdio_printf("[mic] Ready. Short press=record/play, long press(2s)=test tone.\n");
 
     TickType_t xLastWake = xTaskGetTickCount();
-    bool     btnPrev = false;
-    uint32_t btnDead = 0;
+    bool     btnPrev    = false;
+    uint32_t btnDead    = 0;
+    uint32_t btnHoldCnt = 0;   // counts 10ms ticks while held
 
     while (1)
     {
         vTaskDelayUntil(&xLastWake, 10);
 
-        // ---- Button polling with 50 ms debounce ----
+        // ---- Button polling: short press vs long press (2 sec) ----
         uint32_t btnVal;
         am_hal_gpio_state_read(BTN_PIN, AM_HAL_GPIO_INPUT_READ, &btnVal);
         bool btnDown = (btnVal == 0);
@@ -340,13 +360,31 @@ void MicTask(void *pvParameters)
         }
         else if (btnDown && !btnPrev)
         {
-            btnDead = 5;
-
-            if (g_mode == MODE_IDLE)
+            // Button just pressed — start counting
+            btnHoldCnt = 0;
+        }
+        else if (btnDown && btnPrev)
+        {
+            // Button held
+            btnHoldCnt++;
+            if (btnHoldCnt == 200 && g_mode == MODE_IDLE) // 200 * 10ms = 2 sec
             {
+                // Long press -> test tone
+                g_tonePos = 0;
+                g_mode    = MODE_TESTTONE;
+                am_util_stdio_printf("[mic] TEST TONE: 1kHz square wave, 2 sec...\n");
+                btnDead = 5;
+            }
+        }
+        else if (!btnDown && btnPrev)
+        {
+            // Button released
+            if (btnHoldCnt < 200 && g_mode == MODE_IDLE)
+            {
+                // Short press -> record/play
+                btnDead = 5;
                 if (g_recLen > 0)
                 {
-                    // Already have a recording — play it again
                     g_recPos = 0;
                     g_mode   = MODE_PLAYING;
                     am_util_stdio_printf("[mic] Playing %lu samples...\n",
@@ -354,12 +392,12 @@ void MicTask(void *pvParameters)
                 }
                 else
                 {
-                    // No recording yet — record once
                     g_recPos = 0;
                     g_mode   = MODE_RECORDING;
                     am_util_stdio_printf("[mic] Recording %d sec...\n", REC_SECONDS);
                 }
             }
+            btnHoldCnt = 0;
         }
         btnPrev = btnDown;
 
@@ -367,10 +405,51 @@ void MicTask(void *pvParameters)
         if (g_recDone)
         {
             g_recDone = false;
-            am_util_stdio_printf("[mic] Recording done (%lu samples). Press to play.\n",
-                                 (unsigned long)g_recLen);
 
-            // Dump 32 consecutive samples from 0.5s into recording to inspect waveform.
+            // ---- Buffer analysis: is the noise in the recording? ----
+            int64_t sum = 0;
+            int32_t bMin = g_recBuf[0], bMax = g_recBuf[0];
+            for (uint32_t k = 0; k < g_recLen; k++)
+            {
+                int32_t v = g_recBuf[k];
+                sum += v;
+                if (v < bMin) bMin = v;
+                if (v > bMax) bMax = v;
+            }
+            int32_t bMean = (int32_t)(sum / (int64_t)g_recLen);
+            g_recDC = bMean;   // used by ISR to subtract DC during playback
+
+            // RMS (on >>8 scaled values to avoid overflow)
+            int64_t sqSum = 0;
+            for (uint32_t k = 0; k < g_recLen; k++)
+            {
+                int32_t v = (g_recBuf[k] - bMean) >> 8;
+                sqSum += (int64_t)v * v;
+            }
+            uint32_t rms8 = 0;
+            {
+                // Integer square root of (sqSum / g_recLen)
+                int64_t avg = sqSum / (int64_t)g_recLen;
+                uint32_t r = 0, bit = 1u << 15;
+                while (bit)
+                {
+                    uint32_t t = r | bit;
+                    if ((int64_t)t * t <= avg) r = t;
+                    bit >>= 1;
+                }
+                rms8 = r;
+            }
+
+            am_util_stdio_printf("[mic] BUFFER ANALYSIS:\n");
+            am_util_stdio_printf("  samples=%lu  mean=%ld\n",
+                                 (unsigned long)g_recLen, (long)bMean);
+            am_util_stdio_printf("  min=%ld  max=%ld\n", (long)bMin, (long)bMax);
+            am_util_stdio_printf("  rms(ac,>>8)=%lu  (x256=%lu)\n",
+                                 (unsigned long)rms8, (unsigned long)(rms8 * 256));
+            am_util_stdio_printf("[mic] If rms is high -> noise is in RECORDING (mic).\n");
+            am_util_stdio_printf("[mic] Press short=play, hold 2s=test tone.\n");
+
+            // Dump 32 consecutive samples from 0.5s into recording
             uint32_t dumpStart = REC_SAMPLE_RATE / 2;
             if (dumpStart + 32 <= g_recLen)
             {
@@ -381,10 +460,15 @@ void MicTask(void *pvParameters)
                 }
             }
         }
+        if (g_toneDone)
+        {
+            g_toneDone = false;
+            am_util_stdio_printf("[mic] Test tone done. If clean -> TX path OK, noise is from mic.\n");
+        }
         if (g_playDone)
         {
             g_playDone = false;
-            am_util_stdio_printf("[mic] Playback done. Press to record.\n");
+            am_util_stdio_printf("[mic] Playback done.\n");
         }
 
         // ---- Per-second stats ----
@@ -392,7 +476,8 @@ void MicTask(void *pvParameters)
         {
             g_printReady = 0;
             const char *mstr = (g_mode == MODE_RECORDING) ? "REC" :
-                               (g_mode == MODE_PLAYING)   ? "PLAY" : "IDLE";
+                               (g_mode == MODE_PLAYING)   ? "PLAY" :
+                               (g_mode == MODE_TESTTONE)  ? "TONE" : "IDLE";
             am_util_stdio_printf("[mic] avg=%ld peak=%ld mode=%s even=%08X %08X odd=%08X %08X\n",
                                  (long)g_secAvg, (long)g_secPeakLast, mstr,
                                  g_debugEven[0], g_debugEven[1],
