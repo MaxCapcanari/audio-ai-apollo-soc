@@ -137,6 +137,7 @@ INCLUDES+= -I../../../../../../third_party/cordio/ble-host/sources/stack/l2c
 INCLUDES+= -I../../../../../../third_party/cordio/ble-profiles/sources/apps/app
 INCLUDES+= -I../../../../../../third_party/cordio/ble-profiles/sources/profiles
 INCLUDES+= -I../../../../../../third_party/uecc
+INCLUDES+= -I../../../../../../ambiq_ble/profiles/volecommon/codec/opus
 
 VPATH = ../../../../../../utils
 VPATH+=:../../../../../../third_party/cordio/ble-profiles/sources/profiles/gap
@@ -358,6 +359,7 @@ DEPS+= $(ASRC:%.s=$(CONFIG)/%.d)
 
 LIBS = ../../../../../../mcu/apollo4p/hal/mcu/gcc/bin/libam_hal.a
 LIBS += ../../../../bsp/gcc/bin/libam_bsp.a
+LIBS += ../../../../../../ambiq_ble/profiles/volecommon/codec/opus/gcc/libopus.a
 
 CFLAGS = -mthumb -mcpu=$(CPU) -mfpu=$(FPU) -mfloat-abi=$(FABI)
 CFLAGS+= -ffunction-sections -fdata-sections -fomit-frame-pointer

@@ -9,6 +9,7 @@
 #include "task.h"
 
 #include "am_util.h"
+#include "ble_opus_stream_svc.h"
 
 #define HELLO_SVC_START_HDL  0x9000
 #define HELLO_VAL_HDL        (HELLO_SVC_START_HDL + 2)
@@ -237,6 +238,24 @@ static uint8_t helloWriteCback(dmConnId_t connId, uint16_t handle,
   if (!helloLooksLikeJsonObject(rxBuf, len))
   {
     helloSetJsonError("invalid_json");
+    helloNotify();
+    return ATT_SUCCESS;
+  }
+
+  /* Forward stream-control commands to the Opus service */
+  if (strstr(rxBuf, "\"stream_start\"") != NULL ||
+      strstr(rxBuf, "\"nack\"") != NULL ||
+      (strstr(rxBuf, "\"ack\"") != NULL && strstr(rxBuf, "\"next\"") != NULL))
+  {
+    bool_t ok = OpusStreamOnJsonCmd(rxBuf, len);
+    if (ok)
+    {
+      helloSetJsonAckLen(len);
+    }
+    else
+    {
+      helloSetJsonError("stream_not_ready");
+    }
     helloNotify();
     return ATT_SUCCESS;
   }

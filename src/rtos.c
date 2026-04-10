@@ -157,7 +157,8 @@ setup_task(void *pvParameters)
 
     xTaskCreate(ButtonTask, "ButtonTask", 256, 0, 2, NULL);
 
-    xTaskCreate(MicTask, "MicTask", 512, 0, 2, NULL);
+    // 8192 words (32 KB) — Opus encoder uses ~10-20 KB of stack per encode call.
+    xTaskCreate(MicTask, "MicTask", 8192, 0, 2, NULL);
 
     vTaskSuspend(NULL);
 

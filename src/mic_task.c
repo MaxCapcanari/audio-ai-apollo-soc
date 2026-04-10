@@ -33,6 +33,7 @@
 #include "task.h"
 
 #include "mic_task.h"
+#include "ae_api.h"     // Ambiq Opus encoder (audio_enc_init / audio_enc_encode_frame)
 
 //*****************************************************************************
 // Configuration
@@ -56,14 +57,31 @@
 #define BTN_PIN             19
 
 // Volume right-shift for playback.  0 = full, 1 = -6 dB, 2 = -12 dB.
-#define PLAY_VOL_SHIFT      1
+#define PLAY_VOL_SHIFT      0
 
-// Recording length
-#define REC_SAMPLE_RATE     23438
-#define REC_SECONDS         5
-#define REC_SAMPLES         (REC_SAMPLE_RATE * REC_SECONDS)   // 46876 mono samples
+// Native I2S sample rate (set by HFRC clock / 64 bits per stereo frame)
+#define MIC_NATIVE_RATE     23438
 
-// Per-second stats reporting
+// PCM storage rate — Opus encoder requires 16 kHz mono input
+#define REC_PCM_RATE        16000
+#define REC_SECONDS         30
+#define REC_PCM_SAMPLES     (REC_PCM_RATE * REC_SECONDS)      // 480000 mono int16
+
+// Opus encoder framing (fixed by SDK library: 20 ms @ 16 kHz, CBR 32 kbit/s)
+#define OPUS_FRAME_SAMPLES  320                               // 20 ms @ 16 kHz
+#define OPUS_FRAME_BYTES    80                                // 32 kbit/s * 20 ms / 8
+#define OPUS_NUM_FRAMES     (REC_SECONDS * 50)                // 1500 frames in 30 s
+#define OPUS_BUF_BYTES      (OPUS_NUM_FRAMES * OPUS_FRAME_BYTES) // 120000 bytes
+
+// Resampler step in 16.16 Q-format: how many input samples to consume
+// per output sample.
+//   capture:  out=16000, in=23438  -> step = 23438/16000 ≈ 1.4649
+//   playback: out=23438, in=16000  -> step = 16000/23438 ≈ 0.6826
+#define CAP_STEP_Q16  (uint32_t)(((uint64_t)MIC_NATIVE_RATE << 16) / REC_PCM_RATE)
+#define PLAY_STEP_Q16 (uint32_t)(((uint64_t)REC_PCM_RATE   << 16) / MIC_NATIVE_RATE)
+
+// Per-second stats reporting (in DMA buffers; one DMA buf = 128 stereo frames
+// at 23438 Hz ≈ 5.46 ms, so ~183 buffers per second)
 #define SEC_CHUNKS          183
 
 //*****************************************************************************
@@ -76,10 +94,16 @@ AM_SHARED_RW static uint32_t g_txBufRawA[2 * MIC_DMA_SAMPLES + 3];
 AM_SHARED_RW static uint32_t g_txBufRawB[2 * MIC_DMA_SAMPLES + 3];
 
 //*****************************************************************************
-// Recording buffer — ~183 KB for 2 seconds of mono 24-bit audio
+// Recording buffers (in shared SRAM)
+//   g_pcmBuf  — 16 kHz int16 mono PCM, used for on-device playback
+//   g_opusBuf — Opus 32 kbit/s CBR, ready for BLE transmission
 //*****************************************************************************
 
-AM_SHARED_RW static int32_t g_recBuf[REC_SAMPLES];
+AM_SHARED_RW static int16_t g_pcmBuf[REC_PCM_SAMPLES];   // 960 KB
+AM_SHARED_RW static uint8_t g_opusBuf[OPUS_BUF_BYTES];   // 120 KB
+
+// Encoded Opus length (0 until a recording has been encoded).
+static volatile uint32_t g_opusLen = 0;
 
 //*****************************************************************************
 // State
@@ -99,13 +123,25 @@ static volatile int32_t    g_recDC    = 0;     // DC offset to subtract during p
 static volatile bool       g_recDone  = false;
 static volatile bool       g_playDone = false;
 
-// Test tone state (1 kHz square wave, 2 seconds)
+// Test tone state (1 kHz square wave, 2 seconds at native I2S rate)
 #define TONE_FREQ           1000
-#define TONE_HALF_PERIOD    (REC_SAMPLE_RATE / (TONE_FREQ * 2))  // ~11 samples
+#define TONE_HALF_PERIOD    (MIC_NATIVE_RATE / (TONE_FREQ * 2))  // ~11 samples
 #define TONE_AMPLITUDE      0x200000   // ~25% of 24-bit full scale
-#define TONE_DURATION       (REC_SAMPLE_RATE * 2)  // 2 seconds
+#define TONE_DURATION       (MIC_NATIVE_RATE * 2)  // 2 seconds
 static volatile uint32_t   g_tonePos  = 0;
 static volatile bool       g_toneDone = false;
+
+// Resampler state
+//   Capture (record): 23438 Hz int24 -> 16000 Hz int16
+//     Each input sample adds 65536 to g_capAccum.  When g_capAccum reaches
+//     CAP_STEP_Q16 (~96000), emit one output sample and subtract.
+//   Playback: 16000 Hz int16 -> 23438 Hz int24
+//     Each output sample advances g_playPhaseQ16 by PLAY_STEP_Q16 (~44740).
+//     When phase wraps past 65536, advance the source index.
+static volatile int32_t   g_capLast       = 0;     // last input sample (24-bit signed)
+static volatile uint32_t  g_capAccum      = 0;     // Q16 accumulator
+static volatile uint32_t  g_playPhaseQ16  = 0;     // 0..65535 fractional position
+static volatile uint32_t  g_playSrcIdx    = 0;     // index into g_pcmBuf during playback
 
 // Raw DMA debug: even + odd channel words from start of each second
 static volatile uint32_t g_debugEven[4] = {0};
@@ -118,6 +154,7 @@ static volatile int32_t  g_secAvg       = 0;
 static volatile int32_t  g_secPeak      = 0;
 static volatile int32_t  g_secPeakLast  = 0;
 static volatile uint32_t g_printReady   = 0;
+static bool              g_micDebug     = false;  // set true to enable per-second stats
 
 static am_hal_i2s_transfer_t g_sTransfer;
 
@@ -197,19 +234,53 @@ void am_dspi2s0_isr(void)
             sumOdd += ao;
             if (ao > g_secPeak) g_secPeak = ao;
 
-            // ---- Record: store mono sample ----
-            if (g_mode == MODE_RECORDING && g_recPos < REC_SAMPLES)
+            // ---- Record: decimate 23438 Hz -> 16000 Hz, store as int16 ----
+            if (g_mode == MODE_RECORDING)
             {
-                g_recBuf[g_recPos++] = xo;
+                g_capAccum += 65536u;
+                if (g_capAccum >= CAP_STEP_Q16)
+                {
+                    g_capAccum -= CAP_STEP_Q16;
+                    if (g_recPos < REC_PCM_SAMPLES)
+                    {
+                        // Linear interpolation between previous and current input
+                        int32_t frac = (int32_t)g_capAccum;     // 0..CAP_STEP_Q16-1
+                        int32_t diff = xo - g_capLast;
+                        int32_t s24  = g_capLast +
+                                       (int32_t)(((int64_t)diff * frac) >> 16);
+                        // 24-bit signed -> 16-bit signed (drop LSBs)
+                        int32_t s16  = s24 >> 8;
+                        if (s16 >  32767) s16 =  32767;
+                        if (s16 < -32768) s16 = -32768;
+                        g_pcmBuf[g_recPos++] = (int16_t)s16;
+                    }
+                }
             }
+            g_capLast = xo;
 
             // ---- TX output ----
-            if (g_mode == MODE_PLAYING && g_recPos < g_recLen)
+            if (g_mode == MODE_PLAYING && g_playSrcIdx < g_recLen)
             {
-                int32_t s = g_recBuf[g_recPos++] - g_recDC;
-                uint32_t tx = (uint32_t)((int32_t)(s >> PLAY_VOL_SHIFT)) & 0x00FFFFFF;
+                // Interpolate 16 kHz int16 PCM up to 23438 Hz int24
+                int16_t s0 = g_pcmBuf[g_playSrcIdx];
+                int16_t s1 = (g_playSrcIdx + 1 < g_recLen)
+                             ? g_pcmBuf[g_playSrcIdx + 1] : s0;
+                int32_t out = (int32_t)s0 +
+                              (((int32_t)(s1 - s0) * (int32_t)g_playPhaseQ16) >> 16);
+
+                // 16-bit -> 24-bit, apply optional volume shift
+                int32_t s24 = (out << 8) >> PLAY_VOL_SHIFT;
+                uint32_t tx = (uint32_t)s24 & 0x00FFFFFF;
                 txBuf[i]     = tx;
                 txBuf[i + 1] = tx;
+
+                // Advance phase
+                g_playPhaseQ16 += PLAY_STEP_Q16;
+                while (g_playPhaseQ16 >= 65536u)
+                {
+                    g_playPhaseQ16 -= 65536u;
+                    g_playSrcIdx++;
+                }
             }
             else if (g_mode == MODE_TESTTONE && g_tonePos < TONE_DURATION)
             {
@@ -229,7 +300,7 @@ void am_dspi2s0_isr(void)
         }
 
         // Auto-stop recording when buffer is full
-        if (g_mode == MODE_RECORDING && g_recPos >= REC_SAMPLES)
+        if (g_mode == MODE_RECORDING && g_recPos >= REC_PCM_SAMPLES)
         {
             g_recLen  = g_recPos;
             g_mode    = MODE_IDLE;
@@ -237,7 +308,7 @@ void am_dspi2s0_isr(void)
         }
 
         // Auto-stop playback when done
-        if (g_mode == MODE_PLAYING && g_recPos >= g_recLen)
+        if (g_mode == MODE_PLAYING && g_playSrcIdx >= g_recLen)
         {
             g_mode     = MODE_IDLE;
             g_playDone = true;
@@ -385,15 +456,20 @@ void MicTask(void *pvParameters)
                 btnDead = 5;
                 if (g_recLen > 0)
                 {
-                    g_recPos = 0;
-                    g_mode   = MODE_PLAYING;
-                    am_util_stdio_printf("[mic] Playing %lu samples...\n",
-                                         (unsigned long)g_recLen);
+                    g_playSrcIdx   = 0;
+                    g_playPhaseQ16 = 0;
+                    g_mode         = MODE_PLAYING;
+                    am_util_stdio_printf("[mic] Playing %lu PCM samples (%lu sec)...\n",
+                                         (unsigned long)g_recLen,
+                                         (unsigned long)(g_recLen / REC_PCM_RATE));
                 }
                 else
                 {
-                    g_recPos = 0;
-                    g_mode   = MODE_RECORDING;
+                    g_recPos    = 0;
+                    g_capAccum  = 0;
+                    g_capLast   = 0;
+                    g_opusLen   = 0;
+                    g_mode      = MODE_RECORDING;
                     am_util_stdio_printf("[mic] Recording %d sec...\n", REC_SECONDS);
                 }
             }
@@ -406,59 +482,55 @@ void MicTask(void *pvParameters)
         {
             g_recDone = false;
 
-            // ---- Buffer analysis: is the noise in the recording? ----
+            // ---- Buffer analysis on the 16 kHz int16 PCM ----
             int64_t sum = 0;
-            int32_t bMin = g_recBuf[0], bMax = g_recBuf[0];
+            int16_t bMin = g_pcmBuf[0], bMax = g_pcmBuf[0];
             for (uint32_t k = 0; k < g_recLen; k++)
             {
-                int32_t v = g_recBuf[k];
+                int16_t v = g_pcmBuf[k];
                 sum += v;
                 if (v < bMin) bMin = v;
                 if (v > bMax) bMax = v;
             }
-            int32_t bMean = (int32_t)(sum / (int64_t)g_recLen);
-            g_recDC = bMean;   // used by ISR to subtract DC during playback
+            int16_t bMean = (int16_t)(sum / (int64_t)g_recLen);
 
-            // RMS (on >>8 scaled values to avoid overflow)
-            int64_t sqSum = 0;
+            // Remove DC in-place so playback (and the Opus encoder) sees a
+            // zero-mean signal.
             for (uint32_t k = 0; k < g_recLen; k++)
             {
-                int32_t v = (g_recBuf[k] - bMean) >> 8;
-                sqSum += (int64_t)v * v;
-            }
-            uint32_t rms8 = 0;
-            {
-                // Integer square root of (sqSum / g_recLen)
-                int64_t avg = sqSum / (int64_t)g_recLen;
-                uint32_t r = 0, bit = 1u << 15;
-                while (bit)
-                {
-                    uint32_t t = r | bit;
-                    if ((int64_t)t * t <= avg) r = t;
-                    bit >>= 1;
-                }
-                rms8 = r;
+                int32_t v = (int32_t)g_pcmBuf[k] - bMean;
+                if (v >  32767) v =  32767;
+                if (v < -32768) v = -32768;
+                g_pcmBuf[k] = (int16_t)v;
             }
 
-            am_util_stdio_printf("[mic] BUFFER ANALYSIS:\n");
-            am_util_stdio_printf("  samples=%lu  mean=%ld\n",
-                                 (unsigned long)g_recLen, (long)bMean);
-            am_util_stdio_printf("  min=%ld  max=%ld\n", (long)bMin, (long)bMax);
-            am_util_stdio_printf("  rms(ac,>>8)=%lu  (x256=%lu)\n",
-                                 (unsigned long)rms8, (unsigned long)(rms8 * 256));
-            am_util_stdio_printf("[mic] If rms is high -> noise is in RECORDING (mic).\n");
-            am_util_stdio_printf("[mic] Press short=play, hold 2s=test tone.\n");
+            am_util_stdio_printf("[mic] PCM @16kHz: %lu samples, mean=%d, min=%d max=%d\n",
+                                 (unsigned long)g_recLen,
+                                 (int)bMean, (int)bMin, (int)bMax);
 
-            // Dump 32 consecutive samples from 0.5s into recording
-            uint32_t dumpStart = REC_SAMPLE_RATE / 2;
-            if (dumpStart + 32 <= g_recLen)
+            // ---- Encode to Opus (32 kbit/s CBR, 20 ms frames, 16 kHz mono) ----
+            uint32_t totalFrames = g_recLen / OPUS_FRAME_SAMPLES;
+            if (totalFrames > OPUS_NUM_FRAMES) totalFrames = OPUS_NUM_FRAMES;
+
+            am_util_stdio_printf("[mic] Encoding %lu Opus frames...\n",
+                                 (unsigned long)totalFrames);
+            audio_enc_init(0);   // 0 = no per-frame header
+
+            uint32_t opusBytes = 0;
+            for (uint32_t f = 0; f < totalFrames; f++)
             {
-                am_util_stdio_printf("[mic] Samples @%lu:\n", (unsigned long)dumpStart);
-                for (int d = 0; d < 32; d++)
-                {
-                    am_util_stdio_printf("  [%d] %ld\n", d, (long)g_recBuf[dumpStart + d]);
-                }
+                int n = audio_enc_encode_frame(
+                            (short *)&g_pcmBuf[f * OPUS_FRAME_SAMPLES],
+                            OPUS_FRAME_SAMPLES,
+                            &g_opusBuf[opusBytes]);
+                if (n <= 0 || opusBytes + n > OPUS_BUF_BYTES) break;
+                opusBytes += (uint32_t)n;
             }
+            g_opusLen = opusBytes;
+            am_util_stdio_printf("[mic] Opus encode done: %lu bytes (~%lu kbit/s)\n",
+                                 (unsigned long)opusBytes,
+                                 (unsigned long)((opusBytes * 8) / REC_SECONDS / 1000));
+            am_util_stdio_printf("[mic] Press short=play (PCM), hold 2s=test tone.\n");
         }
         if (g_toneDone)
         {
@@ -475,13 +547,28 @@ void MicTask(void *pvParameters)
         if (g_printReady)
         {
             g_printReady = 0;
-            const char *mstr = (g_mode == MODE_RECORDING) ? "REC" :
-                               (g_mode == MODE_PLAYING)   ? "PLAY" :
-                               (g_mode == MODE_TESTTONE)  ? "TONE" : "IDLE";
-            am_util_stdio_printf("[mic] avg=%ld peak=%ld mode=%s even=%08X %08X odd=%08X %08X\n",
-                                 (long)g_secAvg, (long)g_secPeakLast, mstr,
-                                 g_debugEven[0], g_debugEven[1],
-                                 g_debugOdd[0],  g_debugOdd[1]);
+            if (g_micDebug)
+            {
+                const char *mstr = (g_mode == MODE_RECORDING) ? "REC" :
+                                   (g_mode == MODE_PLAYING)   ? "PLAY" :
+                                   (g_mode == MODE_TESTTONE)  ? "TONE" : "IDLE";
+                am_util_stdio_printf("[mic] avg=%ld peak=%ld mode=%s even=%08X %08X odd=%08X %08X\n",
+                                     (long)g_secAvg, (long)g_secPeakLast, mstr,
+                                     g_debugEven[0], g_debugEven[1],
+                                     g_debugOdd[0],  g_debugOdd[1]);
+            }
         }
     }
+}
+
+//*****************************************************************************
+// Public accessor for the encoded Opus buffer (used by the BLE stream svc).
+//*****************************************************************************
+const uint8_t *MicTaskGetOpusData(uint32_t *pLen)
+{
+    if (pLen != NULL)
+    {
+        *pLen = g_opusLen;
+    }
+    return g_opusBuf;
 }
