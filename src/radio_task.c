@@ -112,7 +112,7 @@ void HelloJsonSvcAdd(void);
 // WSF buffer pools.
 //
 //*****************************************************************************
-#define WSF_BUF_POOLS 5
+#define WSF_BUF_POOLS 6
 
 // Important note: the size of g_pui32BufMem should includes both overhead of
 // internal buffer management structure, wsfBufPool_t (up to 16 bytes for each
@@ -121,14 +121,15 @@ void HelloJsonSvcAdd(void);
 // default. Or it may cause WSF buffer pool initialization failure.
 
 // Memory for the buffer pool
-// extra AMOTA_PACKET_SIZE bytes for OTA handling
+// Pool 6 (264 bytes * 8) handles MTU-247 notifications.
+// Pool 5 (344 bytes * 2) covers DB-hash and other large allocations.
 static uint32_t g_pui32BufMem[
-    (WSF_BUF_POOLS * 16 + 16 * 8 + 32 * 4 + 64 * 6 + 280 * 14 + 288 * 4) /
+    (WSF_BUF_POOLS * 16 + 16 * 8 + 32 * 4 + 64 * 6 + 264 * 8 + 280 * 6 + 344 * 2) /
     sizeof(uint32_t)];
 
-// Default pool descriptor.
+// Pool descriptor — sizes must be multiples of 8.
 static wsfBufPoolDesc_t g_psPoolDescriptors[WSF_BUF_POOLS] = {
-    {16, 8}, {32, 4}, {64, 6}, {280, 14}, {288, 4}};
+    {16, 8}, {32, 4}, {64, 6}, {264, 8}, {280, 6}, {344, 2}};
 
 
 //*****************************************************************************

@@ -56,15 +56,16 @@
 // BUTTON0 (SW1, GPIO 17) is reserved for BLE messages.
 #define BTN_PIN             19
 
-// Volume right-shift for playback.  0 = full, 1 = -6 dB, 2 = -12 dB.
-#define PLAY_VOL_SHIFT      0
+// Playback gain multiplier.  1 = unity, 2 = +6 dB, 4 = +12 dB, 8 = +18 dB.
+// Values above 1 will be soft-clipped to 24-bit range.
+#define PLAY_GAIN           8
 
 // Native I2S sample rate (set by HFRC clock / 64 bits per stereo frame)
 #define MIC_NATIVE_RATE     23438
 
 // PCM storage rate — Opus encoder requires 16 kHz mono input
 #define REC_PCM_RATE        16000
-#define REC_SECONDS         30
+#define REC_SECONDS         10
 #define REC_PCM_SAMPLES     (REC_PCM_RATE * REC_SECONDS)      // 480000 mono int16
 
 // Opus encoder framing (fixed by SDK library: 20 ms @ 16 kHz, CBR 32 kbit/s)
@@ -268,8 +269,11 @@ void am_dspi2s0_isr(void)
                 int32_t out = (int32_t)s0 +
                               (((int32_t)(s1 - s0) * (int32_t)g_playPhaseQ16) >> 16);
 
-                // 16-bit -> 24-bit, apply optional volume shift
-                int32_t s24 = (out << 8) >> PLAY_VOL_SHIFT;
+                // 16-bit -> 24-bit with gain, clamp to 24-bit range
+                int32_t s24 = out * PLAY_GAIN;
+                if (s24 >  32767) s24 =  32767;
+                if (s24 < -32768) s24 = -32768;
+                s24 <<= 8;
                 uint32_t tx = (uint32_t)s24 & 0x00FFFFFF;
                 txBuf[i]     = tx;
                 txBuf[i + 1] = tx;
