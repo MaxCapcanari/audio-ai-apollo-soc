@@ -60,10 +60,17 @@ if [[ ! -f "$TARGET_FILE" ]]; then
   exit 1
 fi
 
+# Prefer system patch over Anaconda's broken build
+if [[ -x /usr/bin/patch ]]; then
+  PATCH=/usr/bin/patch
+else
+  PATCH="$(command -v patch)"
+fi
+
 PATCH_OPTS=( -d "$SUITE_ROOT" -p0 )
 
 if [[ "$MODE" == "reverse" ]]; then
-  if ! patch "${PATCH_OPTS[@]}" --dry-run -R < "$PATCH_FILE" >/dev/null; then
+  if ! "$PATCH" "${PATCH_OPTS[@]}" --dry-run -R < "$PATCH_FILE" >/dev/null; then
     echo "Reverse check failed. Patch may not be applied or target differs." >&2
     exit 1
   fi
@@ -73,23 +80,23 @@ if [[ "$MODE" == "reverse" ]]; then
     exit 0
   fi
 
-  patch "${PATCH_OPTS[@]}" -R < "$PATCH_FILE" >/dev/null
+  "$PATCH" "${PATCH_OPTS[@]}" -R < "$PATCH_FILE" >/dev/null
   echo "Reverted patch in: $TARGET_FILE"
   exit 0
 fi
 
-if patch "${PATCH_OPTS[@]}" --dry-run --forward < "$PATCH_FILE" >/dev/null; then
+if "$PATCH" "${PATCH_OPTS[@]}" --dry-run --forward < "$PATCH_FILE" >/dev/null; then
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "Check OK: patch can be applied to $TARGET_FILE"
     exit 0
   fi
 
-  patch "${PATCH_OPTS[@]}" --forward < "$PATCH_FILE" >/dev/null
+  "$PATCH" "${PATCH_OPTS[@]}" --forward < "$PATCH_FILE" >/dev/null
   echo "Applied patch to: $TARGET_FILE"
   exit 0
 fi
 
-if patch "${PATCH_OPTS[@]}" --dry-run -R < "$PATCH_FILE" >/dev/null; then
+if "$PATCH" "${PATCH_OPTS[@]}" --dry-run -R < "$PATCH_FILE" >/dev/null; then
   echo "Patch already applied in: $TARGET_FILE"
   exit 0
 fi
