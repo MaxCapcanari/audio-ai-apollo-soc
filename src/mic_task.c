@@ -190,17 +190,32 @@ static volatile bool        g_toneDone = false;
 
 //*****************************************************************************
 // Per-second stats — AUDADC input path (updated in AUDADC ISR, always active)
+//
+// Each DMA FIFO word contains BOTH channels of the selected PGA pair:
+//   bits [15:4]  = LGDATA  (low-gain  PGA A0 or B0 output)
+//   bits [31:20] = HGDATA  (high-gain PGA A1 or B1 output)
+// We track both so the [IN] line reveals which path carries the signal.
 //*****************************************************************************
 static volatile uint32_t g_audCnt     = 0;
+// LG (low-gain) stats
 static volatile int32_t  g_audSumAbs  = 0;
 static volatile int32_t  g_audPeak    = 0;
 static volatile int16_t  g_audMin     = INT16_MAX;
 static volatile int16_t  g_audMax     = INT16_MIN;
+// HG (high-gain) stats
+static volatile int32_t  g_audHgSumAbs= 0;
+static volatile int32_t  g_audHgPeak  = 0;
+static volatile int16_t  g_audHgMin   = INT16_MAX;
+static volatile int16_t  g_audHgMax   = INT16_MIN;
 // Latched for task to read
 static volatile int32_t  g_audAvg     = 0;
 static volatile int32_t  g_audPkLast  = 0;
 static volatile int16_t  g_audMinLast = 0;
 static volatile int16_t  g_audMaxLast = 0;
+static volatile int32_t  g_audHgAvg   = 0;
+static volatile int32_t  g_audHgPkLast= 0;
+static volatile int16_t  g_audHgMinLast = 0;
+static volatile int16_t  g_audHgMaxLast = 0;
 static volatile bool     g_audPrint   = false;
 
 //*****************************************************************************
@@ -381,41 +396,65 @@ void am_audadc0_isr(void)
         //----------------------------------------------------------------------
         // Live input stats — always active regardless of mode.
         // Operations: add, compare.  No multiply/divide.  Safe in ISR.
+        //
+        // FIFO word layout (per apollo4p audadc_regs.html line 3110):
+        //   [15:4]  LGDATA  — PGA A0 (low-gain path)
+        //   [31:20] HGDATA  — PGA A1 (high-gain path)
+        // Both fields are filled on every scan; TAG bits [3:0] are masked off.
         //----------------------------------------------------------------------
         for (uint32_t i = 0; i < AUDADC_DMA_SAMPLES; i++)
         {
-            // Each DMA word: upper 16 bits = channel tag, lower 16 = sample.
-            int16_t s = (int16_t)(buf[i] & 0xFFFFU);
-            int32_t a = (s < 0) ? -(int32_t)s : (int32_t)s;
-            g_audSumAbs += a;
-            if (a > g_audPeak) g_audPeak = a;
-            if (s < g_audMin)  g_audMin  = s;
-            if (s > g_audMax)  g_audMax  = s;
+            // LG path (PGA A0)
+            int16_t sLg = (int16_t)(buf[i] & 0xFFF0U);
+            int32_t aLg = (sLg < 0) ? -(int32_t)sLg : (int32_t)sLg;
+            g_audSumAbs += aLg;
+            if (aLg > g_audPeak) g_audPeak = aLg;
+            if (sLg < g_audMin)  g_audMin  = sLg;
+            if (sLg > g_audMax)  g_audMax  = sLg;
+
+            // HG path (PGA A1) — this is what CHSEL=SE1 selects
+            int16_t sHg = (int16_t)((buf[i] >> 16) & 0xFFF0U);
+            int32_t aHg = (sHg < 0) ? -(int32_t)sHg : (int32_t)sHg;
+            g_audHgSumAbs += aHg;
+            if (aHg > g_audHgPeak) g_audHgPeak = aHg;
+            if (sHg < g_audHgMin)  g_audHgMin  = sHg;
+            if (sHg > g_audHgMax)  g_audHgMax  = sHg;
         }
 
         g_audCnt++;
         if (g_audCnt >= AUD_SEC_CHUNKS)
         {
-            g_audAvg     = g_audSumAbs / (AUD_SEC_CHUNKS * AUDADC_DMA_SAMPLES);
-            g_audPkLast  = g_audPeak;
-            g_audMinLast = g_audMin;
-            g_audMaxLast = g_audMax;
-            g_audSumAbs  = 0;
-            g_audPeak    = 0;
-            g_audMin     = INT16_MAX;
-            g_audMax     = INT16_MIN;
-            g_audCnt     = 0;
-            g_audPrint   = true;
+            g_audAvg       = g_audSumAbs  / (AUD_SEC_CHUNKS * AUDADC_DMA_SAMPLES);
+            g_audPkLast    = g_audPeak;
+            g_audMinLast   = g_audMin;
+            g_audMaxLast   = g_audMax;
+            g_audHgAvg     = g_audHgSumAbs / (AUD_SEC_CHUNKS * AUDADC_DMA_SAMPLES);
+            g_audHgPkLast  = g_audHgPeak;
+            g_audHgMinLast = g_audHgMin;
+            g_audHgMaxLast = g_audHgMax;
+            g_audSumAbs    = 0;
+            g_audPeak      = 0;
+            g_audMin       = INT16_MAX;
+            g_audMax       = INT16_MIN;
+            g_audHgSumAbs  = 0;
+            g_audHgPeak    = 0;
+            g_audHgMin     = INT16_MAX;
+            g_audHgMax     = INT16_MIN;
+            g_audCnt       = 0;
+            g_audPrint     = true;
         }
 
         //----------------------------------------------------------------------
         // Recording — store samples into g_recBuf.
+        // Use HGDATA (bits [31:20]) since slot 0 CHSEL=SE1 routes PGA A1
+        // (high-gain path) as the primary. LGDATA carries PGA A0 in parallel
+        // but at the low-gain setting for reference only.
         //----------------------------------------------------------------------
         if (g_mode == MODE_RECORDING)
         {
             for (uint32_t i = 0; i < AUDADC_DMA_SAMPLES && g_recPos < REC_SAMPLES; i++)
             {
-                g_recBuf[g_recPos++] = (int16_t)(buf[i] & 0xFFFFU);
+                g_recBuf[g_recPos++] = (int16_t)((buf[i] >> 16) & 0xFFF0U);
             }
 
             if (g_recPos >= REC_SAMPLES)
@@ -866,40 +905,30 @@ void MicTask(void *pvParameters)
                 if (diagTick >= 300)   // 300 × 10 ms = 3 s
                 {
                     diagDone = true;
-                    am_util_stdio_printf("[DIAG] AUDADC register snapshot:
-");
-                    am_util_stdio_printf("  CFG         = 0x%08X  (ADCEN bit1=%lu)
-",
+                    am_util_stdio_printf("[DIAG] AUDADC register snapshot:\n");
+                    am_util_stdio_printf("  CFG         = 0x%08X  (ADCEN bit1=%lu)\n",
                         (unsigned)AUDADC->CFG,
                         (unsigned long)((AUDADC->CFG >> 1) & 1));
-                    am_util_stdio_printf("  INTTRIGTIMER= 0x%08X  (TIMEREN bit0=%lu)
-",
+                    am_util_stdio_printf("  INTTRIGTIMER= 0x%08X  (TIMEREN bit0=%lu)\n",
                         (unsigned)AUDADC->INTTRIGTIMER,
                         (unsigned long)(AUDADC->INTTRIGTIMER & 1));
-                    am_util_stdio_printf("  DMACFG      = 0x%08X  (DMAEN=%lu)
-",
+                    am_util_stdio_printf("  DMACFG      = 0x%08X  (DMAEN=%lu)\n",
                         (unsigned)AUDADC->DMACFG,
                         (unsigned long)(AUDADC->DMACFG & 1));
-                    am_util_stdio_printf("  DMASTAT     = 0x%08X  (TIP=%lu CPL=%lu ERR=%lu)
-",
+                    am_util_stdio_printf("  DMASTAT     = 0x%08X  (TIP=%lu CPL=%lu ERR=%lu)\n",
                         (unsigned)AUDADC->DMASTAT,
                         (unsigned long)((AUDADC->DMASTAT >> 2) & 1),
                         (unsigned long)((AUDADC->DMASTAT >> 1) & 1),
                         (unsigned long)((AUDADC->DMASTAT >> 0) & 1));
-                    am_util_stdio_printf("  DMATOTCOUNT = %lu  (0=complete, 480=never started)
-",
+                    am_util_stdio_printf("  DMATOTCOUNT = %lu  (0=complete, 480=never started)\n",
                         (unsigned long)AUDADC->DMATOTCOUNT);
-                    am_util_stdio_printf("  DMATARGADDR = 0x%08X
-",
+                    am_util_stdio_printf("  DMATARGADDR = 0x%08X\n",
                         (unsigned)AUDADC->DMATARGADDR);
-                    am_util_stdio_printf("  INTSTAT     = 0x%08X  (non-0 = ISR not firing)
-",
+                    am_util_stdio_printf("  INTSTAT     = 0x%08X  (non-0 = ISR not firing)\n",
                         (unsigned)AUDADC->INTSTAT);
-                    am_util_stdio_printf("  INTEN       = 0x%08X
-",
+                    am_util_stdio_printf("  INTEN       = 0x%08X\n",
                         (unsigned)AUDADC->INTEN);
-                    am_util_stdio_printf("  FIFOSTAT    = 0x%08X
-",
+                    am_util_stdio_printf("  FIFOSTAT    = 0x%08X\n",
                         (unsigned)AUDADC->FIFOSTAT);
                 }
             }
@@ -924,13 +953,15 @@ void MicTask(void *pvParameters)
                             (g_mode == MODE_PLAYING)   ? "PLAY" :
                             (g_mode == MODE_TESTTONE)  ? "TONE" : "IDLE";
             am_util_stdio_printf(
-                "[IN ] %s  avg=%4ld  peak=%4ld  min=%6d  max=%6d  span=%5ld\n",
+                "[IN ] %s  LG avg=%4ld pk=%4ld span=%5ld   "
+                "HG avg=%4ld pk=%4ld span=%5ld\n",
                 m,
                 (long)g_audAvg,
                 (long)g_audPkLast,
-                (int)g_audMinLast,
-                (int)g_audMaxLast,
-                (long)((int32_t)g_audMaxLast - (int32_t)g_audMinLast));
+                (long)((int32_t)g_audMaxLast - (int32_t)g_audMinLast),
+                (long)g_audHgAvg,
+                (long)g_audHgPkLast,
+                (long)((int32_t)g_audHgMaxLast - (int32_t)g_audHgMinLast));
         }
 
         //----------------------------------------------------------------------
