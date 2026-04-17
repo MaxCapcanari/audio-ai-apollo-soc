@@ -621,15 +621,39 @@ static bool audadc_init(uint32_t ptrA)
     //--------------------------------------------------------------------------
     // 9. Slot configuration.
     //
-    //    Slot 0: SE1 = LPADC_D0P = J17 pin 4.
-    //    Slots 1-3: disabled.  ui32TrkCyc = 30 = AM_HAL_AUDADC_MIN_TRKCYC.
+    //    LPADC_D0P (pad A11, op-amp output) drives differential pair A of the
+    //    AUDADC.  Pair A has two PGA front-ends:
+    //        PGA A0 = low-gain  path  (reported via FIFO LGDATA field)
+    //        PGA A1 = high-gain path  (reported via FIFO HGDATA field)
+    //
+    //    In SAMPMODE_MED, a single slot entry always carries BOTH the LG and
+    //    HG samples of its pair — the CHSEL field only influences which path
+    //    "leads" the acquisition.  The canonical Ambiq mapping (see the
+    //    audadc_rtt_stream reference example and the slot→PGA hardwiring in
+    //    am_hal_audadc_slot_dc_offset_calculate) is:
+    //
+    //        slot 0 / SE0  -> pair A, LG (A0) lead  (HG field = A1 sample)
+    //        slot 1 / SE1  -> pair A, HG (A1) lead
+    //        slot 2 / SE2  -> pair B, LG (B0) lead
+    //        slot 3 / SE3  -> pair B, HG (B1) lead
+    //
+    //    Earlier firmware configured slot 0 with CHSEL=SE1, which is an
+    //    off-convention combo that produced no FIFO entries on hardware —
+    //    symptom: AUDADC ISR never fires, FIFOSTAT stays at 0 even though
+    //    ADCEN=1 and TIMEREN=1.  Using the canonical slot 0 / SE0 mapping
+    //    and reading the HG field from the FIFO gives us PGA A1 (the high
+    //    gain path) as the recorded sample, which is what the ISR already
+    //    does via  `(int16_t)((buf[i] >> 16) & 0xFFF0U)`.
+    //
+    //    Slots 1-3 are intentionally left unconfigured.
+    //    ui32TrkCyc = 30 = AM_HAL_AUDADC_MIN_TRKCYC.
     //--------------------------------------------------------------------------
     am_hal_audadc_slot_config_t slot =
     {
         .eMeasToAvg     = AM_HAL_AUDADC_SLOT_AVG_1,
         .ui32TrkCyc     = 30,
         .ePrecisionMode = AM_HAL_AUDADC_SLOT_12BIT,
-        .eChannel       = AM_HAL_AUDADC_SLOT_CHSEL_SE1,
+        .eChannel       = AM_HAL_AUDADC_SLOT_CHSEL_SE0,
         .bWindowCompare = false,
         .bEnabled       = true,
     };
@@ -906,9 +930,10 @@ void MicTask(void *pvParameters)
                 {
                     diagDone = true;
                     am_util_stdio_printf("[DIAG] AUDADC register snapshot:\n");
-                    am_util_stdio_printf("  CFG         = 0x%08X  (ADCEN bit1=%lu)\n",
+                    am_util_stdio_printf("  CFG         = 0x%08X  (ADCEN bit0=%lu  RPTEN bit2=%lu)\n",
                         (unsigned)AUDADC->CFG,
-                        (unsigned long)((AUDADC->CFG >> 1) & 1));
+                        (unsigned long)(AUDADC->CFG & 1),
+                        (unsigned long)((AUDADC->CFG >> 2) & 1));
                     am_util_stdio_printf("  INTTRIGTIMER= 0x%08X  (TIMEREN bit0=%lu)\n",
                         (unsigned)AUDADC->INTTRIGTIMER,
                         (unsigned long)(AUDADC->INTTRIGTIMER & 1));

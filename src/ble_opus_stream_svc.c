@@ -297,3 +297,21 @@ void OpusStreamSetMtu(uint16_t mtu)
                          (unsigned)g_attMtu);
   }
 }
+
+/*
+ * Stubs for the windowed-flow-control pump API referenced by the patched
+ * fit_main.c.  The full implementation lives on the main Opus branch
+ * (commit 283f784).  On the `audio_analog` branch we only care about the
+ * AUDADC capture path, so these stubs let the firmware link and boot.
+ * Re-plumbing the pump path is tracked separately.
+ */
+void OpusStreamTick(void)
+{
+  /* no-op on this branch */
+}
+
+void OpusStreamSetPumpCallback(void (*fn)(uint16_t))
+{
+  (void)fn;
+  /* no-op on this branch */
+}
