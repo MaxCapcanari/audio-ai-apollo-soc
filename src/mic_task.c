@@ -231,6 +231,7 @@ void am_dspi2s0_isr(void)
         for (uint32_t i = 0; i < MIC_DMA_SAMPLES; i += 2)
         {
             int32_t xo = extract_sample(rxBuf[i + 1]);   // odd = right/WS-LOW
+
             int32_t ao = (xo < 0 ? -xo : xo) >> 8;
             sumOdd += ao;
             if (ao > g_secPeak) g_secPeak = ao;
@@ -511,6 +512,32 @@ void MicTask(void *pvParameters)
             am_util_stdio_printf("[mic] PCM @16kHz: %lu samples, mean=%d, min=%d max=%d\n",
                                  (unsigned long)g_recLen,
                                  (int)bMean, (int)bMin, (int)bMax);
+
+            // ---- Normalize: scale PCM to use full int16 range ----
+            // Find peak absolute value after DC removal.
+            int32_t peakAbs = 0;
+            for (uint32_t k = 0; k < g_recLen; k++)
+            {
+                int32_t a = (g_pcmBuf[k] < 0) ? -g_pcmBuf[k] : g_pcmBuf[k];
+                if (a > peakAbs) peakAbs = a;
+            }
+            // Scale so peak maps to ~30000 (leave headroom from 32767).
+            // gain is Q10 fixed-point: gain = (30000 << 10) / peakAbs
+            if (peakAbs > 0 && peakAbs < 30000)
+            {
+                uint32_t gainQ10 = (30000u << 10) / (uint32_t)peakAbs;
+                for (uint32_t k = 0; k < g_recLen; k++)
+                {
+                    int32_t v = ((int32_t)g_pcmBuf[k] * (int32_t)gainQ10) >> 10;
+                    if (v >  32767) v =  32767;
+                    if (v < -32768) v = -32768;
+                    g_pcmBuf[k] = (int16_t)v;
+                }
+                am_util_stdio_printf("[mic] Normalized: peak %ld -> 30000 (gain x%lu.%lu)\n",
+                                     (long)peakAbs,
+                                     (unsigned long)(gainQ10 >> 10),
+                                     (unsigned long)((gainQ10 & 0x3FF) * 10 / 1024));
+            }
 
             // ---- Encode to Opus (32 kbit/s CBR, 20 ms frames, 16 kHz mono) ----
             uint32_t totalFrames = g_recLen / OPUS_FRAME_SAMPLES;
