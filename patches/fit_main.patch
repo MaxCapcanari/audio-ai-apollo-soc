@@ -1,84 +1,110 @@
---- third_party/cordio/ble-profiles/sources/apps/fit/fit_main.c	2026-02-05 18:38:08.000000000 -0800
-+++ third_party/cordio/ble-profiles/sources/apps/fit/fit_main.c	2026-04-10 13:31:50.000000000 -0700
-@@ -60,21 +60,32 @@
+--- third_party/cordio/ble-profiles/sources/apps/fit/fit_main.c	2026-04-19 13:30:26.000000000 -0700
++++ third_party/cordio/ble-profiles/sources/apps/fit/fit_main.c	2026-04-19 13:36:17.000000000 -0700
+@@ -49,6 +49,7 @@
+ #include "rscp/rscp_api.h"
+ #include "fit_api.h"
+ #include "atts_main.h"
++#include "am_util.h"
+ 
+ #ifdef AM_BLE_EATT
+ #include "att_eatt.h"
+@@ -67,12 +68,33 @@
  /* Default Running Speed and Cadence Measurement period (seconds) */
- #define FIT_DEFAULT_RSCM_PERIOD 1
+ #define FIT_DEFAULT_RSCM_PERIOD        1
  
--/* Hello JSON service handle + CCC (must match hello_json_svc.c) */
 +/* Hello JSON service handle + CCC (must match ble_json_svc.c) */
- #define HELLO_SVC_START_HDL  0x9000
- #define HELLO_CCC_HDL (HELLO_SVC_START_HDL + 3)
- 
--/* Hello JSON service hooks implemented in hello_json_svc.c */
++#define HELLO_SVC_START_HDL  0x9000
++#define HELLO_CCC_HDL (HELLO_SVC_START_HDL + 3)
++
 +/* Opus stream service handle + CCC (must match ble_opus_stream_svc.c) */
 +#define OPUS_SVC_START_HDL  0x9010
 +#define OPUS_CCC_HDL (OPUS_SVC_START_HDL + 3)
 +#define FIT_OPUS_STREAM_PERIOD_MS 20U
 +
 +/* Hello JSON service hooks implemented in ble_json_svc.c */
- void HelloJsonSvcAdd(void);
- void HelloJsonCccState(dmConnId_t connId, bool_t enabled);
- void HelloJsonConnClose(dmConnId_t connId);
++void HelloJsonSvcAdd(void);
++void HelloJsonCccState(dmConnId_t connId, bool_t enabled);
++void HelloJsonConnClose(dmConnId_t connId);
 +void OpusStreamSvcAdd(void);
 +void OpusStreamCccState(dmConnId_t connId, bool_t enabled);
 +void OpusStreamConnClose(dmConnId_t connId);
 +void OpusStreamSetMtu(uint16_t mtu);
 +void OpusStreamSetPumpCallback(void (*fn)(uint16_t));
 +void OpusStreamTick(void);
- 
++
  /*! WSF message event enumeration */
- enum {
-   FIT_HR_TIMER_IND = FIT_MSG_START, /*! Heart rate measurement timer expired */
-   FIT_BATT_TIMER_IND,               /*! Battery measurement timer expired */
--  FIT_RUNNING_TIMER_IND /*! Running speed and cadence measurement timer expired
--                         */
-+  FIT_RUNNING_TIMER_IND, /*! Running speed and cadence measurement timer expired */
+ enum
+ {
+   FIT_HR_TIMER_IND = FIT_MSG_START,       /*! Heart rate measurement timer expired */
+   FIT_BATT_TIMER_IND,                     /*! Battery measurement timer expired */
+-  FIT_RUNNING_TIMER_IND                   /*! Running speed and cadence measurement timer expired */
++  FIT_RUNNING_TIMER_IND,                  /*! Running speed and cadence measurement timer expired */
 +  FIT_OPUS_TIMER_IND
  };
  
  /**************************************************************************************************
-@@ -127,6 +138,14 @@
-     5     /*! Number of update attempts before giving up */
+@@ -130,6 +152,15 @@
+   5                                       /*! Number of update attempts before giving up */
  };
  
 +/*! ATT configurable parameters (increase MTU for Opus streaming) */
-+static const attCfg_t fitAttCfg = {
-+    15,                       /*! ATT server service discovery connection idle timeout in seconds */
-+    247,                      /*! desired ATT MTU */
-+    ATT_MAX_TRANS_TIMEOUT,    /*! transaction timeout in seconds */
-+    4                         /*! number of queued prepare writes supported by server */
++static const attCfg_t fitAttCfg =
++{
++    15,                                     /*! ATT server service discovery connection idle timeout in seconds */
++    247,                                    /*! desired ATT MTU */
++    ATT_MAX_TRANS_TIMEOUT,                  /*! transaction timeout in seconds */
++    4                                       /*! number of queued prepare writes supported by server */
 +};
 +
  /*! heart rate measurement configuration */
- static const hrpsCfg_t fitHrpsCfg = {
-     100 /*! Measurement timer expiration period in ms */
-@@ -203,6 +222,7 @@
-   FIT_RSCS_SM_CCC_IDX,  /*! Runninc speed and cadence measurement characteristic
-                          */
-   FIT_HELLO_JSON_CCC_IDX,
+ static const hrpsCfg_t fitHrpsCfg =
+ {
+@@ -204,11 +235,12 @@
+ static const uint8_t fitScanDataDisc[] =
+ {
+   /*! device name */
+-  4,                                      /*! length */
++  20,                                     /*! length */
+   DM_ADV_TYPE_LOCAL_NAME,                 /*! AD type */
+-  'F',
+-  'i',
+-  't'
++  'E', 'a', 't', 'i', 'n', 'g',
++  'A', 'n', 'a', 'l', 'y', 't',
++  'i', 'c', 's', '_',
++  'A', 'A', 'I'
+ };
+ 
+ /**************************************************************************************************
+@@ -222,6 +254,8 @@
+   FIT_HRS_HRM_CCC_IDX,                    /*! Heart rate service, heart rate monitor characteristic */
+   FIT_BATT_LVL_CCC_IDX,                   /*! Battery service, battery level characteristic */
+   FIT_RSCS_SM_CCC_IDX,                   /*! Runninc speed and cadence measurement characteristic */
++  FIT_HELLO_JSON_CCC_IDX,
 +  FIT_OPUS_STREAM_CCC_IDX,
    FIT_NUM_CCC_IDX
  };
  
-@@ -218,7 +238,8 @@
-      DM_SEC_LEVEL_NONE}, /* FIT_BATT_LVL_CCC_IDX */
-     {RSCS_RSM_CH_CCC_HDL, ATT_CLIENT_CFG_NOTIFY,
-      DM_SEC_LEVEL_NONE}, /* FIT_RSCS_SM_CCC_IDX */
--    {HELLO_CCC_HDL, ATT_CLIENT_CFG_NOTIFY, DM_SEC_LEVEL_NONE}};
-+    {HELLO_CCC_HDL, ATT_CLIENT_CFG_NOTIFY, DM_SEC_LEVEL_NONE},
-+    {OPUS_CCC_HDL, ATT_CLIENT_CFG_NOTIFY, DM_SEC_LEVEL_NONE}};
+@@ -232,7 +266,9 @@
+   {GATT_SC_CH_CCC_HDL,    ATT_CLIENT_CFG_INDICATE,  DM_SEC_LEVEL_NONE},   /* FIT_GATT_SC_CCC_IDX */
+   {HRS_HRM_CH_CCC_HDL,    ATT_CLIENT_CFG_NOTIFY,    DM_SEC_LEVEL_NONE},   /* FIT_HRS_HRM_CCC_IDX */
+   {BATT_LVL_CH_CCC_HDL,   ATT_CLIENT_CFG_NOTIFY,    DM_SEC_LEVEL_NONE},   /* FIT_BATT_LVL_CCC_IDX */
+-  {RSCS_RSM_CH_CCC_HDL,   ATT_CLIENT_CFG_NOTIFY,    DM_SEC_LEVEL_NONE}    /* FIT_RSCS_SM_CCC_IDX */
++  {RSCS_RSM_CH_CCC_HDL,   ATT_CLIENT_CFG_NOTIFY,    DM_SEC_LEVEL_NONE},   /* FIT_RSCS_SM_CCC_IDX */
++  {HELLO_CCC_HDL,          ATT_CLIENT_CFG_NOTIFY,    DM_SEC_LEVEL_NONE},   /* FIT_HELLO_JSON_CCC_IDX */
++  {OPUS_CCC_HDL,           ATT_CLIENT_CFG_NOTIFY,    DM_SEC_LEVEL_NONE}    /* FIT_OPUS_STREAM_CCC_IDX */
+ };
  
  /**************************************************************************************************
-   Global Variables
-@@ -229,6 +250,7 @@
+@@ -244,6 +280,7 @@
  
  /* WSF Timer to send running speed and cadence measurement data */
- wsfTimer_t fitRscmTimer;
-+wsfTimer_t fitOpusTimer;
+ wsfTimer_t     fitRscmTimer;
++wsfTimer_t     fitOpusTimer;
  
- /* Running Speed and Cadence Measurement period - Can be changed at runtime to
-  * vary period */
-@@ -237,6 +259,16 @@
+ /* Running Speed and Cadence Measurement period - Can be changed at runtime to vary period */
+ static uint16_t fitRscmPeriod = FIT_DEFAULT_RSCM_PERIOD;
+@@ -251,6 +288,16 @@
  /* Heart Rate Monitor feature flags */
  static uint8_t fitHrmFlags = CH_HRM_FLAGS_VALUE_8BIT | CH_HRM_FLAGS_ENERGY_EXP;
  
@@ -95,16 +121,34 @@
  /*************************************************************************************************/
  /*!
   *  \brief  Application DM callback.
-@@ -397,6 +429,17 @@
+@@ -418,6 +465,35 @@
      }
      return;
    }
 +
++  /* handle hello json CCC */
++  if (pMsg->ccc.idx == FIT_HELLO_JSON_CCC_IDX)
++  {
++    if (pMsg->ccc.value == ATT_CLIENT_CFG_NOTIFY)
++    {
++      HelloJsonCccState((dmConnId_t)pMsg->ccc.hdr.param, TRUE);
++    }
++    else
++    {
++      HelloJsonCccState((dmConnId_t)pMsg->ccc.hdr.param, FALSE);
++    }
++    return;
++  }
++
 +  /* handle opus stream CCC — stream starts on JSON "stream_start", not here */
-+  if (pMsg->ccc.idx == FIT_OPUS_STREAM_CCC_IDX) {
-+    if (pMsg->ccc.value == ATT_CLIENT_CFG_NOTIFY) {
++  if (pMsg->ccc.idx == FIT_OPUS_STREAM_CCC_IDX)
++  {
++    if (pMsg->ccc.value == ATT_CLIENT_CFG_NOTIFY)
++    {
 +      OpusStreamCccState((dmConnId_t)pMsg->ccc.hdr.param, TRUE);
-+    } else {
++    }
++    else
++    {
 +      OpusStreamCccState((dmConnId_t)pMsg->ccc.hdr.param, FALSE);
 +      WsfTimerStop(&fitOpusTimer);
 +    }
@@ -113,65 +157,69 @@
  }
  
  /*************************************************************************************************/
-@@ -417,8 +460,10 @@
+@@ -439,6 +515,10 @@
  
    /* Stop running speed and cadence timer */
    WsfTimerStop(&fitRscmTimer);
 +  WsfTimerStop(&fitOpusTimer);
- 
-   HelloJsonConnClose((dmConnId_t)pMsg->hdr.param);
++
++  HelloJsonConnClose((dmConnId_t)pMsg->hdr.param);
 +  OpusStreamConnClose((dmConnId_t)pMsg->hdr.param);
  }
  
  /*************************************************************************************************/
-@@ -575,6 +620,10 @@
-     fitSendRunningSpeedMeasurement((dmConnId_t)pMsg->ccc.hdr.param);
-     break;
+@@ -461,6 +541,9 @@
+   AppAdvSetData(APP_ADV_DATA_CONNECTABLE, sizeof(fitAdvDataDisc), (uint8_t *) fitAdvDataDisc);
+   AppAdvSetData(APP_SCAN_DATA_CONNECTABLE, sizeof(fitScanDataDisc), (uint8_t *) fitScanDataDisc);
  
-+  case FIT_OPUS_TIMER_IND:
-+    OpusStreamTick();
-+    break;
++  const char *name = "EatingAnalytics_AAI";
++  AttsSetAttr(GAP_DN_CH_HDL, (uint16_t)strlen(name), (uint8_t *)name);
 +
-   case FIT_HR_TIMER_IND:
-     HrpsProcMsg(&pMsg->hdr);
-     break;
-@@ -594,6 +643,7 @@
+   /* start advertising; automatically set connectable/discoverable mode and bondable mode */
+   AppAdvStart(APP_MODE_AUTO_INIT);
  
-   case ATT_MTU_UPDATE_IND:
-     APP_TRACE_INFO1("Negotiated MTU %d", ((attEvt_t *)pMsg)->mtu);
-+    OpusStreamSetMtu(((attEvt_t *)pMsg)->mtu);
-     break;
+@@ -621,6 +704,10 @@
+       fitSendRunningSpeedMeasurement((dmConnId_t)pMsg->ccc.hdr.param);
+       break;
  
-   case DM_RESET_CMPL_IND:
-@@ -634,6 +684,7 @@
-   case DM_CONN_OPEN_IND:
-     am_util_debug_printf("DM_CONN_OPEN_IND\r\n");
++    case FIT_OPUS_TIMER_IND:
++      OpusStreamTick();
++      break;
++
+     case FIT_HR_TIMER_IND:
+       HrpsProcMsg(&pMsg->hdr);
+       break;
+@@ -640,6 +727,7 @@
  
-+    OpusStreamSetMtu(23);
-     HrpsProcMsg(&pMsg->hdr);
-     BasProcMsg(&pMsg->hdr);
-     // AppSlaveSecurityReq(1);
-@@ -756,6 +807,7 @@
+     case ATT_MTU_UPDATE_IND:
+       APP_TRACE_INFO1("Negotiated MTU %d", ((attEvt_t *)pMsg)->mtu);
++      OpusStreamSetMtu(((attEvt_t *)pMsg)->mtu);
+       break;
+ 
+     case DM_RESET_CMPL_IND:
+@@ -688,6 +776,9 @@
+       break;
+ 
+     case DM_CONN_OPEN_IND:
++      am_util_debug_printf("DM_CONN_OPEN_IND\r\n");
++
++      OpusStreamSetMtu(23);
+       HrpsProcMsg(&pMsg->hdr);
+       BasProcMsg(&pMsg->hdr);
+       // AppSlaveSecurityReq(1);
+@@ -830,6 +921,7 @@
  
    /* Set stack configuration pointers */
-   pSmpCfg = (smpCfg_t *)&fitSmpCfg;
-+  pAttCfg = (attCfg_t *)&fitAttCfg;
- 
-   /* initialize heart rate profile sensor */
-   HrpsInit(handlerId, (hrpsCfg_t *)&fitHrpsCfg);
-@@ -820,6 +872,8 @@
-   }
-   am_util_debug_printf("HELLO_CCC_HDL=%u (0x%04X)\r\n", (unsigned)HELLO_CCC_HDL,
-                        (unsigned)HELLO_CCC_HDL);
-+  am_util_debug_printf("OPUS_CCC_HDL=%u (0x%04X)\r\n", (unsigned)OPUS_CCC_HDL,
-+                       (unsigned)OPUS_CCC_HDL);
- 
-   /* Register for app framework callbacks */
-   AppUiBtnRegister(fitBtnCback);
-@@ -834,6 +888,8 @@
+   pSmpCfg = (smpCfg_t *) &fitSmpCfg;
++  pAttCfg = (attCfg_t *) &fitAttCfg;
+ #ifdef AM_BLE_EATT
+   pEattCfg = (eattCfg_t *) &fiteattCfg;
+ #endif
+@@ -912,6 +1004,9 @@
+   SvcBattCbackRegister(BasReadCback, NULL);
    SvcBattAddGroup();
    SvcRscsAddGroup();
-   HelloJsonSvcAdd();
++  HelloJsonSvcAdd();
 +  OpusStreamSvcAdd();
 +  OpusStreamSetPumpCallback(fitOpusPump);
  
