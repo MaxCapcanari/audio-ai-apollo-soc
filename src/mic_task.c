@@ -56,9 +56,10 @@
 // BUTTON0 (SW1, GPIO 17) is reserved for BLE messages.
 #define BTN_PIN             19
 
-// Playback gain multiplier.  1 = unity, 2 = +6 dB, 4 = +12 dB, 8 = +18 dB.
-// Values above 1 will be soft-clipped to 24-bit range.
-#define PLAY_GAIN           8
+// Playback gain multiplier applied to int16 PCM before 24-bit output.
+// With correct left-justified extraction, PLAY_GAIN=1 maps the full 24-bit
+// mic range to the full 24-bit speaker range (near 0 dB).
+#define PLAY_GAIN           1
 
 // Native I2S sample rate (set by HFRC clock / 64 bits per stereo frame)
 #define MIC_NATIVE_RATE     23438
@@ -118,7 +119,6 @@ static volatile mic_mode_t g_mode     = MODE_IDLE;
 static volatile uint32_t   g_recPos   = 0;
 static volatile uint32_t   g_recLen   = 0;
 static volatile bool       g_nextPlay = false;
-static volatile int32_t    g_recDC    = 0;     // DC offset to subtract during playback
 
 // ISR -> task notification
 static volatile bool       g_recDone  = false;
@@ -196,6 +196,8 @@ static am_hal_i2s_config_t g_sI2SConfig =
 
 static inline int32_t extract_sample(uint32_t raw)
 {
+    // DMA buffer is right-justified: 24-bit sample in bits[23:0], bits[31:24] = 0.
+    // Sign-extend from bit 23 to get a signed 32-bit value.
     return (int32_t)(raw << 8) >> 8;
 }
 
@@ -270,11 +272,10 @@ void am_dspi2s0_isr(void)
                 int32_t out = (int32_t)s0 +
                               (((int32_t)(s1 - s0) * (int32_t)g_playPhaseQ16) >> 16);
 
-                // 16-bit -> 24-bit with gain, clamp to 24-bit range
-                int32_t s24 = out * PLAY_GAIN;
-                if (s24 >  32767) s24 =  32767;
-                if (s24 < -32768) s24 = -32768;
-                s24 <<= 8;
+                // Scale int16 → int24 with gain, clamp to 24-bit range
+                int32_t s24 = ((int32_t)out * PLAY_GAIN) << 8;
+                if (s24 >  0x7FFFFF) s24 =  0x7FFFFF;
+                if (s24 < -0x800000) s24 = -0x800000;
                 uint32_t tx = (uint32_t)s24 & 0x00FFFFFF;
                 txBuf[i]     = tx;
                 txBuf[i + 1] = tx;
@@ -472,7 +473,6 @@ void MicTask(void *pvParameters)
                 {
                     g_recPos    = 0;
                     g_capAccum  = 0;
-                    g_capLast   = 0;
                     g_opusLen   = 0;
                     g_mode      = MODE_RECORDING;
                     am_util_stdio_printf("[mic] Recording %d sec...\n", REC_SECONDS);
@@ -487,57 +487,15 @@ void MicTask(void *pvParameters)
         {
             g_recDone = false;
 
-            // ---- Buffer analysis on the 16 kHz int16 PCM ----
-            int64_t sum = 0;
-            int16_t bMin = g_pcmBuf[0], bMax = g_pcmBuf[0];
-            for (uint32_t k = 0; k < g_recLen; k++)
-            {
-                int16_t v = g_pcmBuf[k];
-                sum += v;
-                if (v < bMin) bMin = v;
-                if (v > bMax) bMax = v;
-            }
-            int16_t bMean = (int16_t)(sum / (int64_t)g_recLen);
-
-            // Remove DC in-place so playback (and the Opus encoder) sees a
-            // zero-mean signal.
-            for (uint32_t k = 0; k < g_recLen; k++)
-            {
-                int32_t v = (int32_t)g_pcmBuf[k] - bMean;
-                if (v >  32767) v =  32767;
-                if (v < -32768) v = -32768;
-                g_pcmBuf[k] = (int16_t)v;
-            }
-
-            am_util_stdio_printf("[mic] PCM @16kHz: %lu samples, mean=%d, min=%d max=%d\n",
-                                 (unsigned long)g_recLen,
-                                 (int)bMean, (int)bMin, (int)bMax);
-
-            // ---- Normalize: scale PCM to use full int16 range ----
-            // Find peak absolute value after DC removal.
+            // ---- Log raw PCM stats for diagnostics ----
             int32_t peakAbs = 0;
             for (uint32_t k = 0; k < g_recLen; k++)
             {
                 int32_t a = (g_pcmBuf[k] < 0) ? -g_pcmBuf[k] : g_pcmBuf[k];
                 if (a > peakAbs) peakAbs = a;
             }
-            // Scale so peak maps to ~30000 (leave headroom from 32767).
-            // gain is Q10 fixed-point: gain = (30000 << 10) / peakAbs
-            if (peakAbs > 0 && peakAbs < 30000)
-            {
-                uint32_t gainQ10 = (30000u << 10) / (uint32_t)peakAbs;
-                for (uint32_t k = 0; k < g_recLen; k++)
-                {
-                    int32_t v = ((int32_t)g_pcmBuf[k] * (int32_t)gainQ10) >> 10;
-                    if (v >  32767) v =  32767;
-                    if (v < -32768) v = -32768;
-                    g_pcmBuf[k] = (int16_t)v;
-                }
-                am_util_stdio_printf("[mic] Normalized: peak %ld -> 30000 (gain x%lu.%lu)\n",
-                                     (long)peakAbs,
-                                     (unsigned long)(gainQ10 >> 10),
-                                     (unsigned long)((gainQ10 & 0x3FF) * 10 / 1024));
-            }
+            am_util_stdio_printf("[mic] PCM @16kHz: %lu samples, peak=%ld\n",
+                                 (unsigned long)g_recLen, (long)peakAbs);
 
             // ---- Encode to Opus (32 kbit/s CBR, 20 ms frames, 16 kHz mono) ----
             uint32_t totalFrames = g_recLen / OPUS_FRAME_SAMPLES;
