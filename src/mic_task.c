@@ -61,12 +61,13 @@
 // BUTTON1 (SW2) = GPIO 19
 #define BTN_PIN             19
 
-// Volume right-shift for playback.  0 = full, 1 = -6 dB, 2 = -12 dB.
-#define PLAY_VOL_SHIFT      1
+// Playback left-shift: scales AC signal up to 24-bit range.
+// AC amplitude ~145 counts -> << 15 brings it to ~4.7M / 8.4M (56% full scale).
+#define PLAY_VOL_SHIFT      15
 
 // AUDADC gain (dB)
-#define PREAMP_GAIN_DB      12
-#define CHANNEL_GAIN_DB     12
+#define PREAMP_GAIN_DB      24
+#define CHANNEL_GAIN_DB     24
 
 // Recording: 5 seconds at 23437 Hz
 #define REC_SAMPLE_RATE     23438
@@ -296,9 +297,13 @@ void am_dspi2s0_isr(void)
         {
             if (g_mode == MODE_PLAYING && g_recPos < g_recLen)
             {
-                // Scale 12-bit audio (stored as 16-bit signed) to 24-bit I2S word
-                int32_t s = (int32_t)(g_recBuf[g_recPos++] - g_recDC) << 8;
-                uint32_t tx = (uint32_t)((int32_t)(s >> PLAY_VOL_SHIFT)) & 0x00FFFFFF;
+                // Scale AC signal to 24-bit range: shift left to fill 24-bit output.
+                int32_t s = (int32_t)(g_recBuf[g_recPos++] - g_recDC);
+                int32_t scaled = s << PLAY_VOL_SHIFT;
+                // Clamp to 24-bit signed range to avoid wrapping artifacts.
+                if (scaled >  0x7FFFFF) scaled =  0x7FFFFF;
+                if (scaled < -0x800000) scaled = -0x800000;
+                uint32_t tx = (uint32_t)(scaled) & 0x00FFFFFF;
                 txBuf[i]     = tx;
                 txBuf[i + 1] = tx;
             }
@@ -445,7 +450,7 @@ static void mic_audadc_init(uint32_t dmaPtrA, uint32_t dmaPtrB)
     am_hal_audadc_configure_dma(g_pAUDADCHandle, &g_sAUDADCDMAConfig);
 
     am_hal_audadc_interrupt_enable(g_pAUDADCHandle,
-        AM_HAL_AUDADC_INT_FIFOOVR1 | AM_HAL_AUDADC_INT_DERR | AM_HAL_AUDADC_INT_DCMP);
+        AM_HAL_AUDADC_INT_DERR | AM_HAL_AUDADC_INT_DCMP);
 
     NVIC_SetPriority(AUDADC0_IRQn, NVIC_configKERNEL_INTERRUPT_PRIORITY);
     NVIC_EnableIRQ(AUDADC0_IRQn);
