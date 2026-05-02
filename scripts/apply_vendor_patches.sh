@@ -15,8 +15,7 @@ USAGE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PATCH_FILE="$REPO_ROOT/patches/fit_main.patch"
-TARGET_REL="third_party/cordio/ble-profiles/sources/apps/fit/fit_main.c"
+PATCH_DIR="$REPO_ROOT/patches"
 
 MODE="apply"
 DRY_RUN=0
@@ -41,8 +40,10 @@ for arg in "$@"; do
   esac
 done
 
-if [[ ! -f "$PATCH_FILE" ]]; then
-  echo "Missing patch file: $PATCH_FILE" >&2
+shopt -s nullglob
+PATCH_FILES=( "$PATCH_DIR"/*.patch )
+if [[ ${#PATCH_FILES[@]} -eq 0 ]]; then
+  echo "No patch files found in $PATCH_DIR" >&2
   exit 1
 fi
 
@@ -50,14 +51,6 @@ if [[ -n "${AMBIQSUITE_ROOT:-}" ]]; then
   SUITE_ROOT="$AMBIQSUITE_ROOT"
 else
   SUITE_ROOT="$(cd "$REPO_ROOT/../../../../.." && pwd)"
-fi
-
-TARGET_FILE="$SUITE_ROOT/$TARGET_REL"
-
-if [[ ! -f "$TARGET_FILE" ]]; then
-  echo "Target file not found: $TARGET_FILE" >&2
-  echo "Set AMBIQSUITE_ROOT to your AmbiqSuite root if this repo is not in the default layout." >&2
-  exit 1
 fi
 
 # Prefer system patch over Anaconda's broken build
@@ -69,37 +62,50 @@ fi
 
 PATCH_OPTS=( -d "$SUITE_ROOT" -p0 )
 
+apply_one() {
+  local pf="$1"
+  if "$PATCH" "${PATCH_OPTS[@]}" --dry-run --forward < "$pf" >/dev/null; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      echo "Check OK: $(basename "$pf") can be applied"
+      return 0
+    fi
+    "$PATCH" "${PATCH_OPTS[@]}" --forward < "$pf" >/dev/null
+    echo "Applied: $(basename "$pf")"
+    return 0
+  fi
+
+  if "$PATCH" "${PATCH_OPTS[@]}" --dry-run -R < "$pf" >/dev/null; then
+    echo "Already applied: $(basename "$pf")"
+    return 0
+  fi
+
+  echo "Patch check failed for $(basename "$pf"): target differs from baseline and patch is not applied." >&2
+  return 1
+}
+
+reverse_one() {
+  local pf="$1"
+  if ! "$PATCH" "${PATCH_OPTS[@]}" --dry-run -R < "$pf" >/dev/null; then
+    echo "Reverse check failed for $(basename "$pf"): patch not applied or target differs." >&2
+    return 1
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "Reverse check OK: $(basename "$pf")"
+    return 0
+  fi
+  "$PATCH" "${PATCH_OPTS[@]}" -R < "$pf" >/dev/null
+  echo "Reverted: $(basename "$pf")"
+}
+
+rc=0
 if [[ "$MODE" == "reverse" ]]; then
-  if ! "$PATCH" "${PATCH_OPTS[@]}" --dry-run -R < "$PATCH_FILE" >/dev/null; then
-    echo "Reverse check failed. Patch may not be applied or target differs." >&2
-    exit 1
-  fi
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "Reverse check OK: patch can be reverted in $TARGET_FILE"
-    exit 0
-  fi
-
-  "$PATCH" "${PATCH_OPTS[@]}" -R < "$PATCH_FILE" >/dev/null
-  echo "Reverted patch in: $TARGET_FILE"
-  exit 0
+  # Reverse in opposite order to apply
+  for ((i=${#PATCH_FILES[@]}-1; i>=0; i--)); do
+    reverse_one "${PATCH_FILES[$i]}" || rc=1
+  done
+else
+  for pf in "${PATCH_FILES[@]}"; do
+    apply_one "$pf" || rc=1
+  done
 fi
-
-if "$PATCH" "${PATCH_OPTS[@]}" --dry-run --forward < "$PATCH_FILE" >/dev/null; then
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "Check OK: patch can be applied to $TARGET_FILE"
-    exit 0
-  fi
-
-  "$PATCH" "${PATCH_OPTS[@]}" --forward < "$PATCH_FILE" >/dev/null
-  echo "Applied patch to: $TARGET_FILE"
-  exit 0
-fi
-
-if "$PATCH" "${PATCH_OPTS[@]}" --dry-run -R < "$PATCH_FILE" >/dev/null; then
-  echo "Patch already applied in: $TARGET_FILE"
-  exit 0
-fi
-
-echo "Patch check failed. Target file differs from expected baseline and patch is not applied." >&2
-exit 1
+exit $rc

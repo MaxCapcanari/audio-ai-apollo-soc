@@ -122,16 +122,17 @@ void HelloJsonSvcAdd(void);
 
 // Memory for the buffer pool
 // Pool 4 (264 bytes * 8) handles MTU-247 notifications.
-// Pool 6 (360 bytes * 2) covers AttsCalculateDbHash() which walks all GATT
-// attributes and allocates one flat buffer (353 bytes with our service set).
-// Must be >= measured peak; next multiple of 8 above 353 is 360.
+// Pool 6 (400 bytes * 2) covers AttsCalculateDbHash() which walks all GATT
+// attributes and allocates one flat buffer (~362 bytes with our 7-service set:
+// GAP42 + GATT46 + HRS37 + DIS87 + BATT19 + RSCS37 + JSON47 + Opus47 = 362).
+// Must be >= measured peak; 400 gives headroom for future service additions.
 static uint32_t g_pui32BufMem[
-    (WSF_BUF_POOLS * 16 + 16 * 8 + 32 * 4 + 64 * 6 + 264 * 8 + 280 * 6 + 360 * 2) /
+    (WSF_BUF_POOLS * 16 + 16 * 8 + 32 * 4 + 64 * 6 + 264 * 8 + 280 * 6 + 400 * 2) /
     sizeof(uint32_t)];
 
 // Pool descriptor — sizes must be multiples of 8.
 static wsfBufPoolDesc_t g_psPoolDescriptors[WSF_BUF_POOLS] = {
-    {16, 8}, {32, 4}, {64, 6}, {264, 8}, {280, 6}, {360, 2}};
+    {16, 8}, {32, 4}, {64, 6}, {264, 8}, {280, 6}, {400, 2}};
 
 
 //*****************************************************************************

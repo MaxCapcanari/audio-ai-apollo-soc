@@ -378,6 +378,14 @@ Reset_Handler(void)
           "        blt     zero_loop");
 
     //
+    // Run C++ static constructors (init_array) before main(). Required for
+    // C++ globals such as TFLite Micro's static op resolver — without this,
+    // their vtable pointers stay zero and the first virtual dispatch faults.
+    //
+    extern void __libc_init_array(void);
+    __libc_init_array();
+
+    //
     // Call the application's entry point.
     //
     main();
@@ -444,4 +452,11 @@ am_default_isr(void)
     {
     }
 }
+
+// C++ runtime stubs newlib-nano does not provide on bare-metal.
+// _init / _fini are SysV ABI hooks called by __libc_init_array / __libc_fini_array.
+// __dso_handle anchors __cxa_atexit registrations (we never run dtors anyway).
+void _init(void) {}
+void _fini(void) {}
+void *__dso_handle = (void *)&__dso_handle;
 

@@ -14,6 +14,7 @@
 
 #include "am_mcu_apollo.h"
 #include "am_bsp.h"
+#include "am_util.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -126,19 +127,17 @@ void am_freertos_wakeup(uint32_t idleTime)
 void
 vApplicationMallocFailedHook(void)
 {
+    am_util_stdio_printf("\r\n[FATAL] FreeRTOS malloc failed\r\n");
     while (1);
 }
 
 void
 vApplicationStackOverflowHook(TaskHandle_t pxTask, char *pcTaskName)
 {
-    (void) pcTaskName;
     (void) pxTask;
-
-    while (1)
-    {
-        __asm("BKPT #0\n") ;
-    }
+    am_util_stdio_printf("\r\n[FATAL] Stack overflow in task: %s\r\n",
+                         pcTaskName ? pcTaskName : "(null)");
+    while (1);
 }
 
 //*****************************************************************************
@@ -153,12 +152,13 @@ setup_task(void *pvParameters)
 
     RadioTaskSetup();
 
-    xTaskCreate(RadioTask, "RadioTask", 512, 0, 3, &radio_task_handle);
+    xTaskCreate(RadioTask, "RadioTask", 1024, 0, 3, &radio_task_handle);
 
     xTaskCreate(ButtonTask, "ButtonTask", 256, 0, 2, NULL);
 
-    // 8192 words (32 KB) — Opus encoder uses ~10-20 KB of stack per encode call.
-    xTaskCreate(MicTask, "MicTask", 8192, 0, 2, NULL);
+    // 16384 words (64 KB) — Opus encoder uses ~10-20 KB; TFLM AllocateTensors
+    // can also be stack-heavy during graph planning.
+    xTaskCreate(MicTask, "MicTask", 16384, 0, 2, NULL);
 
     vTaskSuspend(NULL);
 

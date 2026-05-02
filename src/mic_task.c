@@ -2,22 +2,28 @@
 //
 //! @file mic_task.c
 //!
-//! @brief Mic record/playback via I2S0, controlled by BUTTON0 (SW1).
+//! @brief Mic record/playback: AUDADC analog mic input, I2S0 TX speaker output.
 //!
-//! Press BUTTON0 -> record 2 seconds of audio from INMP441 mic.
-//! Press again   -> play it back through MAX98357A speaker.
-//! Alternates record / play on each press.
+//! Press BUTTON1 (SW2)   -> record REC_SECONDS of audio from CMM-2718AB MEMS mic.
+//! Press again           -> play back through MAX98357A speaker via I2S0 TX.
+//! Long press (2 s)      -> play 1 kHz test tone.
+//!
+//! After recording, audio is resampled 23438 Hz -> 16 kHz mono int16 in
+//! g_pcmBuf and encoded to Opus 32 kbit/s CBR in g_opusBuf for the BLE
+//! stream service.
 //!
 //! Wiring (Apollo4p Blue KXR EVB):
-//!   INMP441 SD    -> GPIO 14  (I2S0_SDIN)
-//!   INMP441 SCK   -> GPIO 11  (I2S0_CLK)
-//!   INMP441 WS    -> GPIO 13  (I2S0_WS)   L/R pin = GND
-//!   MAX98357 DIN  -> GPIO 12  (I2S0_SDOUT)
-//!   MAX98357 BCLK -> GPIO 11  (shared)
-//!   MAX98357 LRC  -> GPIO 13  (shared)
+//!   CMM-2718AB OUT -> 100 nF series cap -> AUDADC SE0 (PGA channel A)
+//!   CMM-2718AB VDD <- VDDAUDA / AUDA (~1.7 V), 100 nF to GND
+//!   MAX98357 BCLK  -> GPIO 11 (I2S0_CLK)
+//!   MAX98357 LRC   -> GPIO 13 (I2S0_WS)
+//!   MAX98357 DIN   -> GPIO 12 (I2S0_SDOUT)
+//!   MAX98357 SD    -> 3.3 V (enable)
 //!
-//! Sample rate: ~23.4 kHz  (HFRC 1.5 MHz BCLK / 64 bits per stereo frame)
-//! Bit depth:   24-bit signed PCM (right-justified in 32-bit DMA word)
+//! Sample rates:
+//!   AUDADC capture: HFRC 48 MHz / div32 / 64 = 23,437.5 Hz
+//!   I2S TX:         HFRC 1.5 MHz BCLK / 64 bits per stereo frame = 23,437.5 Hz
+//!   PCM storage:    16 kHz mono int16 (Opus encoder native rate)
 //
 //*****************************************************************************
 
@@ -33,65 +39,117 @@
 #include "task.h"
 
 #include "mic_task.h"
-#include "ae_api.h"     // Ambiq Opus encoder (audio_enc_init / audio_enc_encode_frame)
+#include "ae_api.h"         // Ambiq Opus encoder (audio_enc_init / audio_enc_encode_frame)
+#ifndef KWS_DISABLE
+#include "kws_inference.h"  // TFLite KWS wrapper
+#include "ns_audio_mfcc.h"  // MFCC feature extraction
+#endif
 
 //*****************************************************************************
 // Configuration
 //*****************************************************************************
 
 #define MIC_I2S_MODULE      0
-#define MIC_DMA_SAMPLES     256     // words per DMA buffer (128 stereo frames)
 
-// I2S0 GPIO pin assignments
+// I2S0 TX GPIO pins (speaker only — no SDIN: capture is on AUDADC)
 #define MIC_CLK_PIN         11
 #define MIC_CLK_FUNC        AM_HAL_PIN_11_I2S0_CLK
 #define MIC_WS_PIN          13
 #define MIC_WS_FUNC         AM_HAL_PIN_13_I2S0_WS
-#define MIC_SDIN_PIN        14
-#define MIC_SDIN_FUNC       AM_HAL_PIN_14_I2S0_SDIN
 #define MIC_SDOUT_PIN       12
 #define MIC_SDOUT_FUNC      AM_HAL_PIN_12_I2S0_SDOUT
 
-// BUTTON1 (SW2) = GPIO 19 — free since I2S0 uses GPIOs 11-14.
-// BUTTON0 (SW1, GPIO 17) is reserved for BLE messages.
+// I2S TX DMA: 256 words = 128 stereo frames per ISR completion (~5.46 ms).
+#define MIC_DMA_SAMPLES     256
+
+// AUDADC DMA words per completion. SAMPMODE_MED + 4 slots emits 2 DMA words
+// per scan (A-pair + B-pair). 256 words = 128 scans = 128 channel-A samples
+// per completion (~5.46 ms — one ISR call every ~5.46 ms, so ~183/sec).
+#define AUDADC_DMA_WORDS    256
+#define AUDADC_MONO_SAMPLES 128
+
+// AUDADC slot bit-19 selects A-pair (0) or B-pair (1) within each DMA word.
+#define MIC_SRC_A0          0
+#define MIC_SRC_A1          1
+#define MIC_SRC_B0          2
+#define MIC_SRC_B1          3
+#define MIC_RECORD_SOURCE   MIC_SRC_A0   // SE0 = analog mic
+
+// AUDADC gain (dB). PREAMP_GAIN is per-channel preamp; CHANNEL_GAIN is the
+// internal PGA stage. Tuned for CMM-2718AB at conversational distance.
+#define PREAMP_GAIN_DB      12
+#define CHANNEL_GAIN_DB     6
+
+// CMM-2718AB requires 1.6-3.6 V. Apollo MICBIAS trim values below bypass mode
+// only reach ~0.9-1.5 V; trim 63 selects bypass mode (VDDAUDA, ~1.7 V).
+#define MIC_BIAS_TRIM       63
+
+// BUTTON1 (SW2) = GPIO 19. BUTTON0 (SW1, GPIO 17) is reserved for BLE messages.
 #define BTN_PIN             19
 
-// Playback gain multiplier applied to int16 PCM before 24-bit output.
-// With correct left-justified extraction, PLAY_GAIN=1 maps the full 24-bit
-// mic range to the full 24-bit speaker range (near 0 dB).
-#define PLAY_GAIN           1
+// Playback: int16 PCM -> 24-bit I2S TX. Left-shift maps int16 full scale into
+// the int24 range; soft limiter knees in well below clipping so loud peaks
+// compress instead of hard-clipping the 24-bit packer.
+#define PLAY_VOL_SHIFT      9                  // int16 << 9 -> 25-bit, soft-limited
+#define PLAY_LIMIT_START    0x500000
+#define PLAY_LIMIT_MAX      0x7FFFFF
 
-// Native I2S sample rate (set by HFRC clock / 64 bits per stereo frame)
+// Native AUDADC / I2S sample rate
 #define MIC_NATIVE_RATE     23438
 
-// PCM storage rate — Opus encoder requires 16 kHz mono input
+// PCM storage rate — Opus encoder requires 16 kHz mono int16 input.
 #define REC_PCM_RATE        16000
 #define REC_SECONDS         10
-#define REC_PCM_SAMPLES     (REC_PCM_RATE * REC_SECONDS)      // 480000 mono int16
+#define REC_PCM_SAMPLES     (REC_PCM_RATE * REC_SECONDS)
 
 // Opus encoder framing (fixed by SDK library: 20 ms @ 16 kHz, CBR 32 kbit/s)
-#define OPUS_FRAME_SAMPLES  320                               // 20 ms @ 16 kHz
-#define OPUS_FRAME_BYTES    80                                // 32 kbit/s * 20 ms / 8
-#define OPUS_NUM_FRAMES     (REC_SECONDS * 50)                // 1500 frames in 30 s
-#define OPUS_BUF_BYTES      (OPUS_NUM_FRAMES * OPUS_FRAME_BYTES) // 120000 bytes
+#define OPUS_FRAME_SAMPLES  320
+#define OPUS_FRAME_BYTES    80
+#define OPUS_NUM_FRAMES     (REC_SECONDS * 50)
+#define OPUS_BUF_BYTES      (OPUS_NUM_FRAMES * OPUS_FRAME_BYTES)
 
-// Resampler step in 16.16 Q-format: how many input samples to consume
-// per output sample.
-//   capture:  out=16000, in=23438  -> step = 23438/16000 ≈ 1.4649
-//   playback: out=23438, in=16000  -> step = 16000/23438 ≈ 0.6826
+// Resampler steps in 16.16 Q-format.
+//   Capture:  out=16000 from in=23438 -> step = 23438/16000 ≈ 1.4649
+//   Playback: out=23438 from in=16000 -> step = 16000/23438 ≈ 0.6826
 #define CAP_STEP_Q16  (uint32_t)(((uint64_t)MIC_NATIVE_RATE << 16) / REC_PCM_RATE)
 #define PLAY_STEP_Q16 (uint32_t)(((uint64_t)REC_PCM_RATE   << 16) / MIC_NATIVE_RATE)
 
-// Per-second stats reporting (in DMA buffers; one DMA buf = 128 stereo frames
-// at 23438 Hz ≈ 5.46 ms, so ~183 buffers per second)
+// Per-second stats: 23438 Hz / 128 mono samples per ISR ≈ 183 ISR calls/sec.
 #define SEC_CHUNKS          183
 
+#ifndef KWS_DISABLE
+#define KWS_FRAME_SAMPLES   320     // 20 ms @ 16 kHz
+#define KWS_MFCC_COEFFS     10
+#define KWS_MFCC_FBANK_BINS 40
+#define KWS_MFCC_FRAME_POW2 512
+
+// neuralSPOT ns_mfcc_map_arena / ns_fbanks_map_arena multiply pointer-arithmetic
+// offsets by sizeof(T) on a T* pointer, inflating the layout by 4×. The
+// buffers don't overlap as long as the arena is large enough; 64 KB is plenty.
+#define MFCC_ARENA_BYTES    (64 * 1024)
+#endif
+
 //*****************************************************************************
-// DMA buffers — must be in shared RAM and 16-byte aligned
+// DMA buffers — shared SRAM, 16-byte aligned
 //*****************************************************************************
 
-AM_SHARED_RW static uint32_t g_rxBufRawA[2 * MIC_DMA_SAMPLES + 3];
-AM_SHARED_RW static uint32_t g_rxBufRawB[2 * MIC_DMA_SAMPLES + 3];
+#ifndef KWS_DISABLE
+// KWS ping-pong (ISR fills one while task reads the other)
+AM_SHARED_RW static int16_t  g_kwsBuf[2][KWS_FRAME_SAMPLES];
+static volatile uint32_t     g_kwsWriteBuf = 0;
+static volatile uint32_t     g_kwsWritePos = 0;
+static volatile uint32_t     g_kwsReadyBuf = 0xFF;
+
+AM_SHARED_RW static uint8_t  g_mfccArena[MFCC_ARENA_BYTES];
+static float                 g_mfccFeatures[KWS_NUM_FRAMES * KWS_NUM_COEFFS];
+static uint32_t              g_mfccFrameCount = 0;
+static ns_mfcc_cfg_t         g_mfccCfg;
+#endif
+
+// AUDADC ping+pong contiguous buffer (HAL alternates halves automatically).
+AM_SHARED_RW static uint32_t g_audadcBufRaw[2 * AUDADC_DMA_WORDS + 3];
+
+// I2S TX ping/pong
 AM_SHARED_RW static uint32_t g_txBufRawA[2 * MIC_DMA_SAMPLES + 3];
 AM_SHARED_RW static uint32_t g_txBufRawB[2 * MIC_DMA_SAMPLES + 3];
 
@@ -101,52 +159,56 @@ AM_SHARED_RW static uint32_t g_txBufRawB[2 * MIC_DMA_SAMPLES + 3];
 //   g_opusBuf — Opus 32 kbit/s CBR, ready for BLE transmission
 //*****************************************************************************
 
-AM_SHARED_RW static int16_t g_pcmBuf[REC_PCM_SAMPLES];   // 960 KB
-AM_SHARED_RW static uint8_t g_opusBuf[OPUS_BUF_BYTES];   // 120 KB
+AM_SHARED_RW static int16_t g_pcmBuf[REC_PCM_SAMPLES];
+AM_SHARED_RW static uint8_t g_opusBuf[OPUS_BUF_BYTES];
 
-// Encoded Opus length (0 until a recording has been encoded).
 static volatile uint32_t g_opusLen = 0;
 
 //*****************************************************************************
 // State
 //*****************************************************************************
 
-static void *g_pI2SHandle = NULL;
+static void *g_pI2SHandle    = NULL;
+static void *g_pAUDADCHandle = NULL;
 
-typedef enum { MODE_IDLE, MODE_RECORDING, MODE_PLAYING, MODE_TESTTONE } mic_mode_t;
+typedef enum { MODE_LISTENING, MODE_IDLE, MODE_RECORDING, MODE_PLAYING, MODE_TESTTONE } mic_mode_t;
 
-static volatile mic_mode_t g_mode     = MODE_IDLE;
+#ifdef KWS_DISABLE
+#define MIC_MODE_INITIAL  MODE_IDLE
+#else
+#define MIC_MODE_INITIAL  MODE_LISTENING
+#endif
+
+static volatile mic_mode_t g_mode     = MIC_MODE_INITIAL;
 static volatile uint32_t   g_recPos   = 0;
 static volatile uint32_t   g_recLen   = 0;
-static volatile bool       g_nextPlay = false;
 
-// ISR -> task notification
 static volatile bool       g_recDone  = false;
 static volatile bool       g_playDone = false;
 
-// Test tone state (1 kHz square wave, 2 seconds at native I2S rate)
+// Test tone: 1 kHz square wave, 2 seconds at native rate.
 #define TONE_FREQ           1000
-#define TONE_HALF_PERIOD    (MIC_NATIVE_RATE / (TONE_FREQ * 2))  // ~11 samples
-#define TONE_AMPLITUDE      0x200000   // ~25% of 24-bit full scale
-#define TONE_DURATION       (MIC_NATIVE_RATE * 2)  // 2 seconds
+#define TONE_HALF_PERIOD    (MIC_NATIVE_RATE / (TONE_FREQ * 2))
+#define TONE_AMPLITUDE      0x200000
+#define TONE_DURATION       (MIC_NATIVE_RATE * 2)
 static volatile uint32_t   g_tonePos  = 0;
 static volatile bool       g_toneDone = false;
 
-// Resampler state
-//   Capture (record): 23438 Hz int24 -> 16000 Hz int16
-//     Each input sample adds 65536 to g_capAccum.  When g_capAccum reaches
-//     CAP_STEP_Q16 (~96000), emit one output sample and subtract.
-//   Playback: 16000 Hz int16 -> 23438 Hz int24
-//     Each output sample advances g_playPhaseQ16 by PLAY_STEP_Q16 (~44740).
-//     When phase wraps past 65536, advance the source index.
-static volatile int32_t   g_capLast       = 0;     // last input sample (24-bit signed)
-static volatile uint32_t  g_capAccum      = 0;     // Q16 accumulator
-static volatile uint32_t  g_playPhaseQ16  = 0;     // 0..65535 fractional position
-static volatile uint32_t  g_playSrcIdx    = 0;     // index into g_pcmBuf during playback
+// Capture-side resampler state (23438 Hz int16-scaled -> 16000 Hz int16)
+static volatile int32_t   g_capLast       = 0;
+static volatile uint32_t  g_capAccum      = 0;
 
-// Raw DMA debug: even + odd channel words from start of each second
-static volatile uint32_t g_debugEven[4] = {0};
-static volatile uint32_t g_debugOdd[4]  = {0};
+// DC blocker (single-pole IIR HPF). The CMM-2718AB has a measurable DC bias
+// at the AUDADC pin; leaving it in skews FFT bin 0 and any subsequent feature.
+//   y[n] = x[n] - x[n-1] + R * y[n-1]
+// R = 32440/32768 ≈ 0.9900 → corner ≈ 37 Hz at 23.4 kHz (well below speech).
+#define DC_BLOCK_R_Q15  32440
+static volatile int32_t   g_dcPrevIn      = 0;
+static volatile int32_t   g_dcPrevOut     = 0;
+
+// Playback-side resampler state (16000 Hz int16 -> 23438 Hz int24)
+static volatile uint32_t  g_playPhaseQ16  = 0;
+static volatile uint32_t  g_playSrcIdx    = 0;
 
 // Per-second debug stats
 static volatile uint32_t g_dmaBufCount  = 0;
@@ -155,7 +217,12 @@ static volatile int32_t  g_secAvg       = 0;
 static volatile int32_t  g_secPeak      = 0;
 static volatile int32_t  g_secPeakLast  = 0;
 static volatile uint32_t g_printReady   = 0;
-static bool              g_micDebug     = false;  // set true to enable per-second stats
+static volatile uint32_t g_audadcIsrCount = 0;
+static bool              g_micDebug     = false;
+
+//*****************************************************************************
+// I2S TX-only configuration (master, drives MAX98357 speaker amp)
+//*****************************************************************************
 
 static am_hal_i2s_transfer_t g_sTransfer;
 
@@ -185,160 +252,250 @@ static am_hal_i2s_config_t g_sI2SConfig =
     .eDiv3  = 0,
     .eASRC  = 0,
     .eMode  = AM_HAL_I2S_IO_MODE_MASTER,
-    .eXfer  = AM_HAL_I2S_XFER_RXTX,
+    .eXfer  = AM_HAL_I2S_XFER_TX,
     .eData  = &g_sDataConfig,
     .eIO    = &g_sIOConfig,
+};
+
+//*****************************************************************************
+// AUDADC configuration
+//*****************************************************************************
+
+static am_hal_audadc_dma_config_t g_sAUDADCDMAConfig =
+{
+    .bDynamicPriority         = true,
+    .ePriority                = AM_HAL_AUDADC_PRIOR_SERVICE_IMMED,
+    .bDMAEnable               = true,
+    .ui32SampleCount          = AUDADC_DMA_WORDS,
+    .ui32TargetAddress        = 0,
+    .ui32TargetAddressReverse = 0,
+};
+
+static am_hal_audadc_gain_config_t g_sAudadcGainConfig =
+{
+    .ui32LGA      = 0,
+    .ui32HGADELTA = 0,
+    .ui32LGB      = 0,
+    .ui32HGBDELTA = 0,
+    .eUpdateMode  = AM_HAL_AUDADC_GAIN_UPDATE_IMME,
 };
 
 //*****************************************************************************
 // Helpers
 //*****************************************************************************
 
-static inline int32_t extract_sample(uint32_t raw)
+// AUDADC DMA word layout: 12-bit sample left-justified in bits[15:4] (low slot)
+// and bits[31:20] (high slot). Cast to int16 sign-extends; result is full
+// int16-scaled (~±32K) so no further shift is needed before resampling.
+static inline int32_t extract_audadc_low_sample(uint32_t raw)
 {
-    // DMA buffer is right-justified: 24-bit sample in bits[23:0], bits[31:24] = 0.
-    // Sign-extend from bit 23 to get a signed 32-bit value.
-    return (int32_t)(raw << 8) >> 8;
+    return (int32_t)((int16_t)(raw & 0xFFF0));
 }
 
+static inline int32_t extract_audadc_high_sample(uint32_t raw)
+{
+    return (int32_t)((int16_t)((raw >> 16) & 0xFFF0));
+}
+
+static inline int32_t extract_record_sample(uint32_t raw, uint32_t src)
+{
+    return (src == MIC_SRC_A0 || src == MIC_SRC_B0)
+           ? extract_audadc_low_sample(raw)
+           : extract_audadc_high_sample(raw);
+}
+
+static inline bool audadc_word_matches_src(uint32_t raw, uint32_t src)
+{
+    bool isB = ((raw >> 19) & 1) != 0;
+    return isB ? (src == MIC_SRC_B0 || src == MIC_SRC_B1)
+               : (src == MIC_SRC_A0 || src == MIC_SRC_A1);
+}
+
+static inline uint32_t pack_i2s24_tx(int32_t sample)
+{
+    if (sample >  0x7FFFFF) sample =  0x7FFFFF;
+    if (sample < -0x800000) sample = -0x800000;
+    return (uint32_t)(sample & 0x00FFFFFF);
+}
+
+static inline int32_t soft_limit_i2s24(int32_t sample)
+{
+    if (sample > PLAY_LIMIT_START)
+    {
+        sample = PLAY_LIMIT_START + ((sample - PLAY_LIMIT_START) >> 2);
+        if (sample > PLAY_LIMIT_MAX) sample = PLAY_LIMIT_MAX;
+    }
+    else if (sample < -PLAY_LIMIT_START)
+    {
+        sample = -PLAY_LIMIT_START + ((sample + PLAY_LIMIT_START) >> 2);
+        if (sample < -PLAY_LIMIT_MAX) sample = -PLAY_LIMIT_MAX;
+    }
+    return sample;
+}
 
 //*****************************************************************************
-// ISR — I2S0
+// ISR — AUDADC0 (capture path: DC-block + resample to 16 kHz int16)
+//*****************************************************************************
+
+void am_audadc0_isr(void)
+{
+    uint32_t mask;
+    am_hal_audadc_interrupt_status(g_pAUDADCHandle, &mask, false);
+    am_hal_audadc_interrupt_clear(g_pAUDADCHandle, mask);
+
+    g_audadcIsrCount++;
+
+    if (!(mask & AM_HAL_AUDADC_INT_DCMP))
+    {
+        return;
+    }
+
+    am_hal_audadc_interrupt_service(g_pAUDADCHandle, &g_sAUDADCDMAConfig);
+
+    const uint32_t *rxBuf =
+        (const uint32_t *)am_hal_audadc_dma_get_buffer(g_pAUDADCHandle);
+
+    int32_t sumAbs = 0;
+    for (uint32_t i = 0; i < AUDADC_DMA_WORDS; i++)
+    {
+        if (!audadc_word_matches_src(rxBuf[i], MIC_RECORD_SOURCE)) continue;
+
+        int32_t xo_raw = extract_record_sample(rxBuf[i], MIC_RECORD_SOURCE);
+
+        // DC blocker: y[n] = x[n] - x[n-1] + R * y[n-1]
+        int32_t xo = xo_raw - g_dcPrevIn +
+                     (int32_t)(((int64_t)DC_BLOCK_R_Q15 * g_dcPrevOut) >> 15);
+        g_dcPrevIn  = xo_raw;
+        g_dcPrevOut = xo;
+
+        int32_t ao = (xo < 0 ? -xo : xo);
+        sumAbs += ao;
+        if (ao > g_secPeak) g_secPeak = ao;
+
+        // Resample 23438 -> 16000 (active in LISTENING and RECORDING)
+        if (g_mode == MODE_LISTENING || g_mode == MODE_RECORDING)
+        {
+            g_capAccum += 65536u;
+            if (g_capAccum >= CAP_STEP_Q16)
+            {
+                g_capAccum -= CAP_STEP_Q16;
+                int32_t frac = (int32_t)g_capAccum;
+                int32_t diff = xo - g_capLast;
+                int32_t s16  = g_capLast +
+                               (int32_t)(((int64_t)diff * frac) >> 16);
+                if (s16 >  32767) s16 =  32767;
+                if (s16 < -32768) s16 = -32768;
+
+                if (g_mode == MODE_RECORDING && g_recPos < REC_PCM_SAMPLES)
+                {
+                    g_pcmBuf[g_recPos++] = (int16_t)s16;
+                }
+#ifndef KWS_DISABLE
+                else if (g_mode == MODE_LISTENING && g_kwsReadyBuf == 0xFF)
+                {
+                    uint32_t wb = g_kwsWriteBuf;
+                    g_kwsBuf[wb][g_kwsWritePos++] = (int16_t)s16;
+                    if (g_kwsWritePos == KWS_FRAME_SAMPLES)
+                    {
+                        g_kwsWritePos = 0;
+                        g_kwsReadyBuf = wb;
+                        g_kwsWriteBuf = wb ^ 1u;
+                    }
+                }
+#endif
+            }
+        }
+        g_capLast = xo;
+    }
+
+    // Auto-stop recording when buffer is full
+    if (g_mode == MODE_RECORDING && g_recPos >= REC_PCM_SAMPLES)
+    {
+        g_recLen  = g_recPos;
+        g_mode    = MODE_IDLE;
+        g_recDone = true;
+    }
+
+    // Per-second stats
+    g_secSumAbs += sumAbs;
+    g_dmaBufCount++;
+    if (g_dmaBufCount >= SEC_CHUNKS)
+    {
+        g_secAvg      = g_secSumAbs / (SEC_CHUNKS * AUDADC_MONO_SAMPLES);
+        g_secPeakLast = g_secPeak;
+        g_secSumAbs   = 0;
+        g_secPeak     = 0;
+        g_dmaBufCount = 0;
+        g_printReady  = 1;
+    }
+}
+
+//*****************************************************************************
+// ISR — I2S0 (TX-only: playback / test tone / silence)
 //*****************************************************************************
 
 void am_dspi2s0_isr(void)
 {
-    uint32_t ui32Status;
-    am_hal_i2s_interrupt_status_get(g_pI2SHandle, &ui32Status, true);
-    am_hal_i2s_interrupt_clear(g_pI2SHandle, ui32Status);
-    am_hal_i2s_interrupt_service(g_pI2SHandle, ui32Status, &g_sI2SConfig);
+    uint32_t status;
+    am_hal_i2s_interrupt_status_get(g_pI2SHandle, &status, true);
+    am_hal_i2s_interrupt_clear(g_pI2SHandle, status);
+    am_hal_i2s_interrupt_service(g_pI2SHandle, status, &g_sI2SConfig);
 
-    if (ui32Status & AM_HAL_I2S_INT_RXDMACPL)
+    if (!(status & AM_HAL_I2S_INT_TXDMACPL))
     {
-        const uint32_t *rxBuf =
-            (const uint32_t *)am_hal_i2s_dma_get_buffer(g_pI2SHandle, AM_HAL_I2S_XFER_RX);
-        uint32_t *txBuf =
-            (uint32_t *)am_hal_i2s_dma_get_buffer(g_pI2SHandle, AM_HAL_I2S_XFER_TX);
+        return;
+    }
 
-        // Capture raw DMA words at start of each second for format diagnostics
-        if (g_dmaBufCount == 0)
+    uint32_t *txBuf =
+        (uint32_t *)am_hal_i2s_dma_get_buffer(g_pI2SHandle, AM_HAL_I2S_XFER_TX);
+
+    for (uint32_t i = 0; i < MIC_DMA_SAMPLES; i += 2)
+    {
+        if (g_mode == MODE_PLAYING && g_playSrcIdx < g_recLen)
         {
-            g_debugEven[0] = rxBuf[0]; g_debugEven[1] = rxBuf[2];
-            g_debugEven[2] = rxBuf[4]; g_debugEven[3] = rxBuf[6];
-            g_debugOdd[0]  = rxBuf[1]; g_debugOdd[1]  = rxBuf[3];
-            g_debugOdd[2]  = rxBuf[5]; g_debugOdd[3]  = rxBuf[7];
-        }
+            int16_t s0 = g_pcmBuf[g_playSrcIdx];
+            int16_t s1 = (g_playSrcIdx + 1 < g_recLen)
+                         ? g_pcmBuf[g_playSrcIdx + 1] : s0;
+            int32_t out = (int32_t)s0 +
+                          (((int32_t)(s1 - s0) * (int32_t)g_playPhaseQ16) >> 16);
 
-        int32_t sumOdd = 0;
-        for (uint32_t i = 0; i < MIC_DMA_SAMPLES; i += 2)
-        {
-            int32_t xo = extract_sample(rxBuf[i + 1]);   // odd = right/WS-LOW
+            int32_t s24 = soft_limit_i2s24(out << PLAY_VOL_SHIFT);
+            uint32_t tx = pack_i2s24_tx(s24);
+            txBuf[i]     = tx;
+            txBuf[i + 1] = tx;
 
-            int32_t ao = (xo < 0 ? -xo : xo) >> 8;
-            sumOdd += ao;
-            if (ao > g_secPeak) g_secPeak = ao;
-
-            // ---- Record: decimate 23438 Hz -> 16000 Hz, store as int16 ----
-            if (g_mode == MODE_RECORDING)
+            g_playPhaseQ16 += PLAY_STEP_Q16;
+            while (g_playPhaseQ16 >= 65536u)
             {
-                g_capAccum += 65536u;
-                if (g_capAccum >= CAP_STEP_Q16)
-                {
-                    g_capAccum -= CAP_STEP_Q16;
-                    if (g_recPos < REC_PCM_SAMPLES)
-                    {
-                        // Linear interpolation between previous and current input
-                        int32_t frac = (int32_t)g_capAccum;     // 0..CAP_STEP_Q16-1
-                        int32_t diff = xo - g_capLast;
-                        int32_t s24  = g_capLast +
-                                       (int32_t)(((int64_t)diff * frac) >> 16);
-                        // 24-bit signed -> 16-bit signed (drop LSBs)
-                        int32_t s16  = s24 >> 8;
-                        if (s16 >  32767) s16 =  32767;
-                        if (s16 < -32768) s16 = -32768;
-                        g_pcmBuf[g_recPos++] = (int16_t)s16;
-                    }
-                }
-            }
-            g_capLast = xo;
-
-            // ---- TX output ----
-            if (g_mode == MODE_PLAYING && g_playSrcIdx < g_recLen)
-            {
-                // Interpolate 16 kHz int16 PCM up to 23438 Hz int24
-                int16_t s0 = g_pcmBuf[g_playSrcIdx];
-                int16_t s1 = (g_playSrcIdx + 1 < g_recLen)
-                             ? g_pcmBuf[g_playSrcIdx + 1] : s0;
-                int32_t out = (int32_t)s0 +
-                              (((int32_t)(s1 - s0) * (int32_t)g_playPhaseQ16) >> 16);
-
-                // Scale int16 → int24 with gain, clamp to 24-bit range
-                int32_t s24 = ((int32_t)out * PLAY_GAIN) << 8;
-                if (s24 >  0x7FFFFF) s24 =  0x7FFFFF;
-                if (s24 < -0x800000) s24 = -0x800000;
-                uint32_t tx = (uint32_t)s24 & 0x00FFFFFF;
-                txBuf[i]     = tx;
-                txBuf[i + 1] = tx;
-
-                // Advance phase
-                g_playPhaseQ16 += PLAY_STEP_Q16;
-                while (g_playPhaseQ16 >= 65536u)
-                {
-                    g_playPhaseQ16 -= 65536u;
-                    g_playSrcIdx++;
-                }
-            }
-            else if (g_mode == MODE_TESTTONE && g_tonePos < TONE_DURATION)
-            {
-                // 1 kHz square wave: positive half then negative half
-                int32_t val = ((g_tonePos / TONE_HALF_PERIOD) & 1)
-                              ? -TONE_AMPLITUDE : TONE_AMPLITUDE;
-                uint32_t tx = (uint32_t)(val) & 0x00FFFFFF;
-                txBuf[i]     = tx;
-                txBuf[i + 1] = tx;
-                g_tonePos++;
-            }
-            else
-            {
-                txBuf[i]     = 0;
-                txBuf[i + 1] = 0;
+                g_playPhaseQ16 -= 65536u;
+                g_playSrcIdx++;
             }
         }
-
-        // Auto-stop recording when buffer is full
-        if (g_mode == MODE_RECORDING && g_recPos >= REC_PCM_SAMPLES)
+        else if (g_mode == MODE_TESTTONE && g_tonePos < TONE_DURATION)
         {
-            g_recLen  = g_recPos;
-            g_mode    = MODE_IDLE;
-            g_recDone = true;
+            int32_t val = ((g_tonePos / TONE_HALF_PERIOD) & 1)
+                          ? -TONE_AMPLITUDE : TONE_AMPLITUDE;
+            uint32_t tx = pack_i2s24_tx(val);
+            txBuf[i]     = tx;
+            txBuf[i + 1] = tx;
+            g_tonePos++;
         }
-
-        // Auto-stop playback when done
-        if (g_mode == MODE_PLAYING && g_playSrcIdx >= g_recLen)
+        else
         {
-            g_mode     = MODE_IDLE;
-            g_playDone = true;
+            txBuf[i]     = 0;
+            txBuf[i + 1] = 0;
         }
+    }
 
-        // Auto-stop test tone when done
-        if (g_mode == MODE_TESTTONE && g_tonePos >= TONE_DURATION)
-        {
-            g_mode     = MODE_IDLE;
-            g_toneDone = true;
-        }
-
-        // Per-second stats
-        g_secSumAbs += sumOdd;
-        g_dmaBufCount++;
-        if (g_dmaBufCount >= SEC_CHUNKS)
-        {
-            g_secAvg      = g_secSumAbs / (SEC_CHUNKS * (MIC_DMA_SAMPLES / 2));
-            g_secPeakLast = g_secPeak;
-            g_secSumAbs   = 0;
-            g_secPeak     = 0;
-            g_dmaBufCount = 0;
-            g_printReady  = 1;
-        }
+    if (g_mode == MODE_PLAYING && g_playSrcIdx >= g_recLen)
+    {
+        g_mode     = MODE_IDLE;
+        g_playDone = true;
+    }
+    if (g_mode == MODE_TESTTONE && g_tonePos >= TONE_DURATION)
+    {
+        g_mode     = MODE_IDLE;
+        g_toneDone = true;
     }
 }
 
@@ -346,10 +503,8 @@ void am_dspi2s0_isr(void)
 // Init
 //*****************************************************************************
 
-static void mic_i2s_init(uint32_t rxPtrA, uint32_t rxPtrB,
-                          uint32_t txPtrA, uint32_t txPtrB)
+static void mic_i2s_tx_init(uint32_t txPtrA, uint32_t txPtrB)
 {
-    // Output pins (CLK, WS, SDOUT): push-pull
     am_hal_gpio_pincfg_t outCfg = { .GP.cfg_b.eGPOutCfg = 1, .GP.cfg_b.ePullup = 0 };
 
     outCfg.GP.cfg_b.uFuncSel = MIC_CLK_FUNC;
@@ -361,22 +516,14 @@ static void mic_i2s_init(uint32_t rxPtrA, uint32_t rxPtrB,
     outCfg.GP.cfg_b.uFuncSel = MIC_SDOUT_FUNC;
     am_hal_gpio_pinconfig(MIC_SDOUT_PIN, outCfg);
 
-    // Input pin (SDIN)
-    am_hal_gpio_pincfg_t inCfg = { .GP.cfg_b.eGPOutCfg = 0, .GP.cfg_b.eGPInput = 1, .GP.cfg_b.ePullup = 0 };
-    inCfg.GP.cfg_b.uFuncSel = MIC_SDIN_FUNC;
-    am_hal_gpio_pinconfig(MIC_SDIN_PIN, inCfg);
-
     am_hal_i2s_initialize(MIC_I2S_MODULE, &g_pI2SHandle);
     am_hal_i2s_power_control(g_pI2SHandle, AM_HAL_I2S_POWER_ON, false);
     am_hal_i2s_configure(g_pI2SHandle, &g_sI2SConfig);
     am_hal_i2s_enable(g_pI2SHandle);
 
-    am_hal_clkgen_control(AM_HAL_CLKGEN_CONTROL_HFRC2_START, false);
-    am_util_delay_us(500);
-
-    g_sTransfer.ui32RxTotalCount        = MIC_DMA_SAMPLES;
-    g_sTransfer.ui32RxTargetAddr        = rxPtrA;
-    g_sTransfer.ui32RxTargetAddrReverse = rxPtrB;
+    g_sTransfer.ui32RxTotalCount        = 0;
+    g_sTransfer.ui32RxTargetAddr        = 0;
+    g_sTransfer.ui32RxTargetAddrReverse = 0;
     g_sTransfer.ui32TxTotalCount        = MIC_DMA_SAMPLES;
     g_sTransfer.ui32TxTargetAddr        = txPtrA;
     g_sTransfer.ui32TxTargetAddrReverse = txPtrB;
@@ -385,7 +532,87 @@ static void mic_i2s_init(uint32_t rxPtrA, uint32_t rxPtrB,
 
     NVIC_SetPriority(I2S0_IRQn, NVIC_configKERNEL_INTERRUPT_PRIORITY);
     NVIC_EnableIRQ(I2S0_IRQn);
-    am_hal_interrupt_master_enable();
+}
+
+static void mic_audadc_init(uint32_t dmaPtrA, uint32_t dmaPtrB)
+{
+    // Power up AUDADC analog front-end. mic_bias must be enabled even though
+    // CMM-2718AB has its own integrated bias; it powers internal converter
+    // biasing and without it the AUDADC produces zero output.
+    am_hal_audadc_refgen_powerup();
+    am_hal_audadc_pga_powerup(0);
+    am_hal_audadc_pga_powerup(1);
+    am_hal_audadc_pga_powerup(2);
+    am_hal_audadc_pga_powerup(3);
+    am_hal_audadc_gain_set(0, 2 * PREAMP_GAIN_DB);
+    am_hal_audadc_gain_set(1, 2 * PREAMP_GAIN_DB);
+    am_hal_audadc_gain_set(2, 2 * PREAMP_GAIN_DB);
+    am_hal_audadc_gain_set(3, 2 * PREAMP_GAIN_DB);
+    am_hal_audadc_micbias_powerup(MIC_BIAS_TRIM);
+    am_util_delay_ms(400);   // bias/refgen settle (per Ambiq example)
+
+    am_hal_audadc_config_t audadcCfg =
+    {
+        .eClock         = AM_HAL_AUDADC_CLKSEL_HFRC_48MHz,
+        .ePolarity      = AM_HAL_AUDADC_TRIGPOL_RISING,
+        .eTrigger       = AM_HAL_AUDADC_TRIGSEL_SOFTWARE,
+        .eClockMode     = AM_HAL_AUDADC_CLKMODE_LOW_LATENCY,
+        .ePowerMode     = AM_HAL_AUDADC_LPMODE0,
+        .eRepeat        = AM_HAL_AUDADC_REPEATING_SCAN,
+        .eRepeatTrigger = AM_HAL_AUDADC_RPTTRIGSEL_INT,
+        .eSampMode      = AM_HAL_AUDADC_SAMPMODE_MED,
+    };
+
+    // IRTT: HFRC 48 MHz / div32 / (63+1) = 23,437.5 Hz — matches I2S TX rate.
+    am_hal_audadc_irtt_config_t irttCfg =
+    {
+        .bIrttEnable      = true,
+        .eClkDiv          = AM_HAL_AUDADC_RPTT_CLK_DIV32,
+        .ui32IrttCountMax = 63,
+    };
+
+    am_hal_audadc_initialize(0, &g_pAUDADCHandle);
+    am_hal_audadc_power_control(g_pAUDADCHandle, AM_HAL_SYSCTRL_WAKE, false);
+    am_hal_audadc_configure(g_pAUDADCHandle, &audadcCfg);
+    am_hal_audadc_configure_irtt(g_pAUDADCHandle, &irttCfg);
+    am_hal_audadc_enable(g_pAUDADCHandle);
+    am_hal_audadc_irtt_enable(g_pAUDADCHandle);
+
+    // 4 slots all 12-bit. Audio comes in on SE0 (channel A LG); SE1-SE3 are
+    // configured per the standard Ambiq reference and the ISR ignores them.
+    am_hal_audadc_slot_config_t slotCfg =
+    {
+        .eMeasToAvg     = AM_HAL_AUDADC_SLOT_AVG_1,
+        .ui32TrkCyc     = 34,
+        .ePrecisionMode = AM_HAL_AUDADC_SLOT_12BIT,
+        .bWindowCompare = false,
+        .bEnabled       = true,
+    };
+    slotCfg.eChannel = AM_HAL_AUDADC_SLOT_CHSEL_SE0;
+    am_hal_audadc_configure_slot(g_pAUDADCHandle, 0, &slotCfg);
+    slotCfg.eChannel = AM_HAL_AUDADC_SLOT_CHSEL_SE1;
+    am_hal_audadc_configure_slot(g_pAUDADCHandle, 1, &slotCfg);
+    slotCfg.eChannel = AM_HAL_AUDADC_SLOT_CHSEL_SE2;
+    am_hal_audadc_configure_slot(g_pAUDADCHandle, 2, &slotCfg);
+    slotCfg.eChannel = AM_HAL_AUDADC_SLOT_CHSEL_SE3;
+    am_hal_audadc_configure_slot(g_pAUDADCHandle, 3, &slotCfg);
+
+    g_sAudadcGainConfig.ui32LGA      = (uint32_t)(CHANNEL_GAIN_DB * 2 + 12);
+    g_sAudadcGainConfig.ui32HGADELTA = 0;
+    g_sAudadcGainConfig.ui32LGB      = (uint32_t)(CHANNEL_GAIN_DB * 2 + 12);
+    g_sAudadcGainConfig.ui32HGBDELTA = 0;
+    g_sAudadcGainConfig.eUpdateMode  = AM_HAL_AUDADC_GAIN_UPDATE_IMME;
+    am_hal_audadc_internal_pga_config(g_pAUDADCHandle, &g_sAudadcGainConfig);
+
+    g_sAUDADCDMAConfig.ui32TargetAddress        = dmaPtrA;
+    g_sAUDADCDMAConfig.ui32TargetAddressReverse = dmaPtrB;
+    am_hal_audadc_configure_dma(g_pAUDADCHandle, &g_sAUDADCDMAConfig);
+
+    am_hal_audadc_interrupt_enable(g_pAUDADCHandle,
+        AM_HAL_AUDADC_INT_DERR | AM_HAL_AUDADC_INT_DCMP);
+
+    NVIC_SetPriority(AUDADC0_IRQn, NVIC_configKERNEL_INTERRUPT_PRIORITY);
+    NVIC_EnableIRQ(AUDADC0_IRQn);
 }
 
 //*****************************************************************************
@@ -396,31 +623,84 @@ void MicTask(void *pvParameters)
 {
     (void)pvParameters;
 
-    uint32_t rxPtrA = (uint32_t)((uint32_t)(g_rxBufRawA + 3) & ~0xF);
-    uint32_t rxPtrB = (uint32_t)((uint32_t)(g_rxBufRawB + 3) & ~0xF);
+    // Align I2S TX buffers to 16 bytes
     uint32_t txPtrA = (uint32_t)((uint32_t)(g_txBufRawA + 3) & ~0xF);
     uint32_t txPtrB = (uint32_t)((uint32_t)(g_txBufRawB + 3) & ~0xF);
-
     memset((void *)txPtrA, 0, MIC_DMA_SAMPLES * sizeof(uint32_t));
     memset((void *)txPtrB, 0, MIC_DMA_SAMPLES * sizeof(uint32_t));
+
+    // Align AUDADC ping-pong buffers (contiguous in one allocation)
+    uint32_t audadcBase = (uint32_t)((uint32_t)(g_audadcBufRaw + 3) & ~0xF);
+    uint32_t dmaPtrA    = audadcBase;
+    uint32_t dmaPtrB    = audadcBase + AUDADC_DMA_WORDS * sizeof(uint32_t);
 
     // BUTTON1 (SW2, GPIO 19): input with 100K pull-up, active low
     am_hal_gpio_pincfg_t btnCfg = {0};
     btnCfg.GP.cfg_b.eGPOutCfg = 0;
     btnCfg.GP.cfg_b.eGPInput  = 1;
     btnCfg.GP.cfg_b.ePullup   = 6;   // AM_HAL_GPIO_PIN_PULLUP_100K
-    btnCfg.GP.cfg_b.uFuncSel  = 3;   // GPIO
+    btnCfg.GP.cfg_b.uFuncSel  = 3;
     am_hal_gpio_pinconfig(BTN_PIN, btnCfg);
 
-    mic_i2s_init(rxPtrA, rxPtrB, txPtrA, txPtrB);
+    am_util_stdio_printf("[mic] task entered\r\n");
+
+#ifndef KWS_DISABLE
+    // Defer KWS init briefly so BLE can finish reset/advertising bring-up.
+    am_util_stdio_printf("[mic] waiting 3s before kws_init\r\n");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    am_util_stdio_printf("[mic] >kws_init\r\n");
+    kws_init();
+    am_util_stdio_printf("[mic] <kws_init\r\n");
+
+    g_mfccCfg.api              = &ns_mfcc_V1_0_0;
+    g_mfccCfg.arena            = g_mfccArena;
+    g_mfccCfg.sample_frequency = REC_PCM_RATE;
+    g_mfccCfg.num_fbank_bins   = KWS_MFCC_FBANK_BINS;
+    g_mfccCfg.low_freq         = 20;
+    g_mfccCfg.high_freq        = 4000;
+    g_mfccCfg.num_frames       = KWS_NUM_FRAMES;
+    g_mfccCfg.num_coeffs       = KWS_MFCC_COEFFS;
+    g_mfccCfg.num_dec_bits     = 0;
+    g_mfccCfg.frame_shift_ms   = 20;
+    g_mfccCfg.frame_len_ms     = 30;
+    g_mfccCfg.frame_len        = KWS_FRAME_SAMPLES;
+    g_mfccCfg.frame_len_pow2   = KWS_MFCC_FRAME_POW2;
+    am_util_stdio_printf("[mic] >ns_mfcc_init\r\n");
+    ns_mfcc_init(&g_mfccCfg);
+    am_util_stdio_printf("[mic] <ns_mfcc_init\r\n");
+#endif
+
+    am_util_stdio_printf("[mic] >mic_audadc_init\r\n");
+    mic_audadc_init(dmaPtrA, dmaPtrB);
+    am_util_stdio_printf("[mic] <mic_audadc_init\r\n");
+
+    am_util_stdio_printf("[mic] >mic_i2s_tx_init\r\n");
+    mic_i2s_tx_init(txPtrA, txPtrB);
+    am_util_stdio_printf("[mic] <mic_i2s_tx_init\r\n");
+
+    am_hal_interrupt_master_enable();
+
+    // Kick off AUDADC repeating scan; IRTT takes over after first trigger.
+    am_hal_audadc_sw_trigger(g_pAUDADCHandle);
+    am_util_stdio_printf("[mic] AUDADC capture started\r\n");
+
+    // I2S TX runs continuously; outputs silence until playback or tone.
     am_hal_i2s_dma_transfer_start(g_pI2SHandle, &g_sI2SConfig);
+    am_util_stdio_printf("[mic] I2S TX DMA started\r\n");
 
+#ifndef KWS_DISABLE
+    am_util_stdio_printf("[mic] Listening for \"%s\". Short press=record, long press(2s)=test tone.\n",
+                         kws_label_names[KWS_TRIGGER_IDX]);
+#else
     am_util_stdio_printf("[mic] Ready. Short press=record/play, long press(2s)=test tone.\n");
+#endif
 
-    TickType_t xLastWake = xTaskGetTickCount();
-    bool     btnPrev    = false;
-    uint32_t btnDead    = 0;
-    uint32_t btnHoldCnt = 0;   // counts 10ms ticks while held
+    TickType_t xLastWake  = xTaskGetTickCount();
+    bool     btnPrev      = false;
+    uint32_t btnDead      = 0;
+    uint32_t btnHoldCnt   = 0;
+    uint32_t diagTicks    = 0;
 
     while (1)
     {
@@ -437,16 +717,13 @@ void MicTask(void *pvParameters)
         }
         else if (btnDown && !btnPrev)
         {
-            // Button just pressed — start counting
             btnHoldCnt = 0;
         }
         else if (btnDown && btnPrev)
         {
-            // Button held
             btnHoldCnt++;
-            if (btnHoldCnt == 200 && g_mode == MODE_IDLE) // 200 * 10ms = 2 sec
+            if (btnHoldCnt == 200 && (g_mode == MODE_IDLE || g_mode == MODE_LISTENING))
             {
-                // Long press -> test tone
                 g_tonePos = 0;
                 g_mode    = MODE_TESTTONE;
                 am_util_stdio_printf("[mic] TEST TONE: 1kHz square wave, 2 sec...\n");
@@ -455,10 +732,8 @@ void MicTask(void *pvParameters)
         }
         else if (!btnDown && btnPrev)
         {
-            // Button released
-            if (btnHoldCnt < 200 && g_mode == MODE_IDLE)
+            if (btnHoldCnt < 200 && (g_mode == MODE_IDLE || g_mode == MODE_LISTENING))
             {
-                // Short press -> record/play
                 btnDead = 5;
                 if (g_recLen > 0)
                 {
@@ -482,12 +757,47 @@ void MicTask(void *pvParameters)
         }
         btnPrev = btnDown;
 
+#ifndef KWS_DISABLE
+        // ---- KWS: process one 20 ms frame when the ISR hands one over ----
+        uint32_t readyBuf = g_kwsReadyBuf;
+        if (readyBuf != 0xFF && g_mode == MODE_LISTENING)
+        {
+            float confidence = 0.0f;
+            ns_mfcc_compute(&g_mfccCfg,
+                            (const int16_t *)g_kwsBuf[readyBuf],
+                            &g_mfccFeatures[g_mfccFrameCount * KWS_MFCC_COEFFS]);
+            g_mfccFrameCount++;
+            g_kwsReadyBuf = 0xFF;
+
+            if (g_mfccFrameCount >= KWS_NUM_FRAMES)
+            {
+                g_mfccFrameCount = 0;
+
+                int keyword = kws_run(g_mfccFeatures, &confidence);
+                if (keyword >= 0 && keyword != 0 && keyword != 1)  // skip silence/unknown
+                {
+                    am_util_stdio_printf("[kws] \"%s\" %.0f%%\n",
+                                        kws_label_names[keyword], confidence * 100.0f);
+                }
+                if (keyword == KWS_TRIGGER_IDX && confidence >= KWS_THRESHOLD)
+                {
+                    am_util_stdio_printf("[kws] TRIGGER -> recording %d sec...\n",
+                                        REC_SECONDS);
+                    g_recPos   = 0;
+                    g_capAccum = 0;
+                    g_opusLen  = 0;
+                    g_mode     = MODE_RECORDING;
+                }
+            }
+        }
+#endif
+
         // ---- ISR notifications ----
         if (g_recDone)
         {
             g_recDone = false;
 
-            // ---- Log raw PCM stats for diagnostics ----
+            // Log raw PCM stats for diagnostics
             int32_t peakAbs = 0;
             for (uint32_t k = 0; k < g_recLen; k++)
             {
@@ -497,13 +807,13 @@ void MicTask(void *pvParameters)
             am_util_stdio_printf("[mic] PCM @16kHz: %lu samples, peak=%ld\n",
                                  (unsigned long)g_recLen, (long)peakAbs);
 
-            // ---- Encode to Opus (32 kbit/s CBR, 20 ms frames, 16 kHz mono) ----
+            // Encode to Opus (32 kbit/s CBR, 20 ms frames, 16 kHz mono)
             uint32_t totalFrames = g_recLen / OPUS_FRAME_SAMPLES;
             if (totalFrames > OPUS_NUM_FRAMES) totalFrames = OPUS_NUM_FRAMES;
 
             am_util_stdio_printf("[mic] Encoding %lu Opus frames...\n",
                                  (unsigned long)totalFrames);
-            audio_enc_init(0);   // 0 = no per-frame header
+            audio_enc_init(0);
 
             uint32_t opusBytes = 0;
             for (uint32_t f = 0; f < totalFrames; f++)
@@ -520,16 +830,47 @@ void MicTask(void *pvParameters)
                                  (unsigned long)opusBytes,
                                  (unsigned long)((opusBytes * 8) / REC_SECONDS / 1000));
             am_util_stdio_printf("[mic] Press short=play (PCM), hold 2s=test tone.\n");
+#ifndef KWS_DISABLE
+            g_mfccFrameCount = 0;
+            g_kwsReadyBuf    = 0xFF;
+            g_kwsWritePos    = 0;
+#endif
+            g_mode           = MIC_MODE_INITIAL;
         }
         if (g_toneDone)
         {
             g_toneDone = false;
-            am_util_stdio_printf("[mic] Test tone done. If clean -> TX path OK, noise is from mic.\n");
+            am_util_stdio_printf("[mic] Test tone done.\n");
+#ifndef KWS_DISABLE
+            g_mfccFrameCount = 0;
+            g_kwsReadyBuf    = 0xFF;
+            g_kwsWritePos    = 0;
+#endif
+            g_mode           = MIC_MODE_INITIAL;
         }
         if (g_playDone)
         {
             g_playDone = false;
             am_util_stdio_printf("[mic] Playback done.\n");
+#ifndef KWS_DISABLE
+            g_mfccFrameCount = 0;
+            g_kwsReadyBuf    = 0xFF;
+            g_kwsWritePos    = 0;
+#endif
+            g_mode           = MIC_MODE_INITIAL;
+        }
+
+        // ---- AUDADC liveness diagnostic every 3 seconds ----
+        diagTicks++;
+        if (diagTicks >= 300)
+        {
+            diagTicks = 0;
+            if (g_micDebug)
+            {
+                am_util_stdio_printf("[mic] audadc_isr_count=%lu recPos=%lu\n",
+                                     (unsigned long)g_audadcIsrCount,
+                                     (unsigned long)g_recPos);
+            }
         }
 
         // ---- Per-second stats ----
@@ -541,10 +882,8 @@ void MicTask(void *pvParameters)
                 const char *mstr = (g_mode == MODE_RECORDING) ? "REC" :
                                    (g_mode == MODE_PLAYING)   ? "PLAY" :
                                    (g_mode == MODE_TESTTONE)  ? "TONE" : "IDLE";
-                am_util_stdio_printf("[mic] avg=%ld peak=%ld mode=%s even=%08X %08X odd=%08X %08X\n",
-                                     (long)g_secAvg, (long)g_secPeakLast, mstr,
-                                     g_debugEven[0], g_debugEven[1],
-                                     g_debugOdd[0],  g_debugOdd[1]);
+                am_util_stdio_printf("[mic] avg=%ld peak=%ld mode=%s\n",
+                                     (long)g_secAvg, (long)g_secPeakLast, mstr);
             }
         }
     }

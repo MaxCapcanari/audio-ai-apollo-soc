@@ -1,0 +1,28 @@
+--- third_party/cordio/ble-host/sources/hci/ambiq/cooper/hci_vs_cooper.c
++++ third_party/cordio/ble-host/sources/hci/ambiq/cooper/hci_vs_cooper.c
+@@ -54,6 +54,7 @@
+ #include "hci_main.h"
+ #include "hci_cmd.h"
+ #include "am_mcu_apollo.h"
++#include "am_util.h"
+ #include "hci_dbg_trc.h"
+ #include "hci_drv_cooper.h"
+ 
+@@ -159,6 +160,8 @@
+   wsfMsgHdr_t    hdr;
+   static uint8_t randCnt;
+ 
++  am_util_stdio_printf("[reset-seq] enter evt=0x%02x\r\n", *pMsg);
++
+   /* if event is a command complete event */
+   if (*pMsg == HCI_CMD_CMPL_EVT)
+   {
+@@ -168,6 +171,8 @@
+     BSTREAM_TO_UINT16(opcode, pMsg);
+     pMsg++;                   /* skip status */
+ 
++    am_util_stdio_printf("[reset-seq] cmd-cmpl opcode=0x%04x\r\n", opcode);
++
+     /* decode opcode */
+     switch (opcode)
+     {

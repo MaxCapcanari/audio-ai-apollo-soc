@@ -55,6 +55,11 @@ TOOLCHAIN ?= arm-none-eabi
 PART = apollo4p
 CPU = cortex-m4
 FPU = fpv4-sp-d16
+
+NEURALSPOT_ROOT ?= /Users/maxim/Downloads/neuralSPOT
+NS_BUILD = $(NEURALSPOT_ROOT)/build/apollo4p_blue_kxr_evb/arm-none-eabi
+TFLM_ROOT = $(NEURALSPOT_ROOT)/extern/tensorflow/helia_rt_v1_6_0
+CMSIS_DSP_ROOT = $(NEURALSPOT_ROOT)/extern/CMSIS/CMSIS-DSP-1.16.2
 # Default to FPU hardware calling convention.  However, some customers and/or
 # applications may need the software calling convention.
 #FABI = softfp
@@ -62,6 +67,8 @@ FABI = hard
 
 LINKER_FILE := ./linker_script.ld
 STARTUP_FILE := ./startup_$(COMPILERNAME).c
+
+CXX = $(TOOLCHAIN)-g++
 
 #### Required Executables ####
 CC = $(TOOLCHAIN)-gcc
@@ -95,6 +102,13 @@ DEFINES+= -DSEC_ECC_CFG=SEC_ECC_CFG_HCI
 DEFINES+= -DAM_PART_APOLLO4P
 DEFINES+= -DAM_FREERTOS
 DEFINES+= -Dgcc
+DEFINES+= -DAM_UTIL_FAULTISR_PRINT
+# KWS is paused while we integrate the new MEMS mic. Code is preserved behind
+# KWS_DISABLE guards in mic_task.c / Makefile — flip this to 0 to re-enable.
+KWS_DISABLE ?= 1
+ifeq ($(KWS_DISABLE),1)
+DEFINES+= -DKWS_DISABLE
+endif
 
 INCLUDES = -I../../../../../../third_party/cordio/ble-profiles/sources/apps
 INCLUDES+= -I../../../../../../third_party/cordio/ble-host/sources/stack/att
@@ -138,6 +152,16 @@ INCLUDES+= -I../../../../../../third_party/cordio/ble-profiles/sources/apps/app
 INCLUDES+= -I../../../../../../third_party/cordio/ble-profiles/sources/profiles
 INCLUDES+= -I../../../../../../third_party/uecc
 INCLUDES+= -I../../../../../../ambiq_ble/profiles/volecommon/codec/opus
+INCLUDES+= -I$(NEURALSPOT_ROOT)/neuralspot/ns-core/includes-api
+INCLUDES+= -I$(NEURALSPOT_ROOT)/neuralspot/ns-harness/includes-api
+INCLUDES+= -I$(NEURALSPOT_ROOT)/neuralspot/ns-utils/includes-api
+INCLUDES+= -I$(NEURALSPOT_ROOT)/neuralspot/ns-audio/includes-api
+INCLUDES+= -I$(TFLM_ROOT)
+INCLUDES+= -I$(TFLM_ROOT)/third_party/flatbuffers/include
+INCLUDES+= -I$(TFLM_ROOT)/third_party/gemmlowp
+INCLUDES+= -I$(TFLM_ROOT)/third_party/ruy
+INCLUDES+= -I$(CMSIS_DSP_ROOT)/Include
+INCLUDES+= -I../src/kws
 
 VPATH = ../../../../../../utils
 VPATH+=:../../../../../../third_party/cordio/ble-profiles/sources/profiles/gap
@@ -170,7 +194,12 @@ VPATH+=:../../../../../../third_party/cordio/ble-profiles/sources/profiles/bas
 VPATH+=:../../../../../../third_party/cordio/ble-profiles/sources/profiles/rscp
 VPATH+=:../../../../../../third_party/uecc
 
+ifeq ($(KWS_DISABLE),1)
 SRC = gap_main.c
+else
+SRC = kws_inference.cc
+SRC += gap_main.c
+endif
 SRC += attc_disc.c
 SRC += attc_main.c
 SRC += attc_proc.c
@@ -349,17 +378,28 @@ SRC += svc_wss.c
 SRC += startup_gcc.c
 
 CSRC = $(filter %.c,$(SRC))
+CCSRC = $(filter %.cc,$(SRC))
 ASRC = $(filter %.s,$(SRC))
 
 OBJS = $(CSRC:%.c=$(CONFIG)/%.o)
+OBJS+= $(CCSRC:%.cc=$(CONFIG)/%.o)
 OBJS+= $(ASRC:%.s=$(CONFIG)/%.o)
 
 DEPS = $(CSRC:%.c=$(CONFIG)/%.d)
+DEPS+= $(CCSRC:%.cc=$(CONFIG)/%.d)
 DEPS+= $(ASRC:%.s=$(CONFIG)/%.d)
 
 LIBS = ../../../../../../mcu/apollo4p/hal/mcu/gcc/bin/libam_hal.a
 LIBS += ../../../../bsp/gcc/bin/libam_bsp.a
 LIBS += ../../../../../../ambiq_ble/profiles/volecommon/codec/opus/gcc/libopus.a
+ifneq ($(KWS_DISABLE),1)
+LIBS += $(NS_BUILD)/neuralspot/ns-audio/ns-audio.a
+LIBS += ./lib/ns-core-noinit.a
+LIBS += $(NS_BUILD)/neuralspot/ns-harness/ns-harness.a
+LIBS += $(NS_BUILD)/neuralspot/ns-utils/ns-utils.a
+LIBS += $(TFLM_ROOT)/lib/libtensorflow-microlite-cm4-gcc-release.a
+LIBS += $(CMSIS_DSP_ROOT)/lib/libCMSISDSP-m4-gcc.a
+endif
 
 CFLAGS = -mthumb -mcpu=$(CPU) -mfpu=$(FPU) -mfloat-abi=$(FABI)
 CFLAGS+= -ffunction-sections -fdata-sections -fomit-frame-pointer
@@ -367,7 +407,16 @@ CFLAGS+= -MMD -MP -std=c99 -Wall -g
 CFLAGS+= -O3
 CFLAGS+= $(DEFINES)
 CFLAGS+= $(INCLUDES)
-CFLAGS+= 
+CFLAGS+=
+
+CXXFLAGS = -mthumb -mcpu=$(CPU) -mfpu=$(FPU) -mfloat-abi=$(FABI)
+CXXFLAGS+= -ffunction-sections -fdata-sections -fomit-frame-pointer
+CXXFLAGS+= -MMD -MP -std=c++17 -fno-exceptions -fno-rtti -fno-threadsafe-statics -Wall -g
+CXXFLAGS+= -O3
+CXXFLAGS+= -DTF_LITE_STRIP_ERROR_STRINGS
+CXXFLAGS+= -DTF_LITE_STATIC_MEMORY
+CXXFLAGS+= $(DEFINES)
+CXXFLAGS+= $(INCLUDES)
 
 LFLAGS = -mthumb -mcpu=$(CPU) -mfpu=$(FPU) -mfloat-abi=$(FABI)
 LFLAGS+= -nostartfiles -static
@@ -393,6 +442,10 @@ $(CONFIG):
 $(CONFIG)/%.o: %.c $(CONFIG)/%.d
 	@echo " Compiling $(COMPILERNAME) $<"
 	$(Q) $(CC) -c $(CFLAGS) $< -o $@
+
+$(CONFIG)/%.o: %.cc $(CONFIG)/%.d
+	@echo " Compiling C++ $(COMPILERNAME) $<"
+	$(Q) $(CXX) -c $(CXXFLAGS) $< -o $@
 
 $(CONFIG)/%.o: %.s $(CONFIG)/%.d
 	@echo " Assembling $(COMPILERNAME) $<"

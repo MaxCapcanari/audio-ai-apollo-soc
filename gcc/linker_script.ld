@@ -24,6 +24,21 @@ SECTIONS
         *(.rodata)
         *(.rodata*)
         . = ALIGN(4);
+        /* C++ static constructors. __libc_init_array iterates this range. */
+        PROVIDE_HIDDEN(__preinit_array_start = .);
+        KEEP(*(.preinit_array))
+        PROVIDE_HIDDEN(__preinit_array_end = .);
+        . = ALIGN(4);
+        PROVIDE_HIDDEN(__init_array_start = .);
+        KEEP(*(SORT(.init_array.*)))
+        KEEP(*(.init_array))
+        PROVIDE_HIDDEN(__init_array_end = .);
+        . = ALIGN(4);
+        PROVIDE_HIDDEN(__fini_array_start = .);
+        KEEP(*(SORT(.fini_array.*)))
+        KEEP(*(.fini_array))
+        PROVIDE_HIDDEN(__fini_array_end = .);
+        . = ALIGN(4);
         _etext = .;
     } > MCU_MRAM
 
@@ -77,5 +92,13 @@ SECTIONS
         KEEP(*(.shared))
         . = ALIGN(4);
     } > SHARED_SRAM AT>MCU_MRAM
+
+    .sram_bss (NOLOAD):
+    {
+        . = ALIGN(4);
+        *(.sram_bss)
+        . = ALIGN(4);
+    } > SHARED_SRAM
+
     .ARM.attributes 0 : { *(.ARM.attributes) }
 }

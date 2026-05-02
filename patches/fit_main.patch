@@ -1,5 +1,5 @@
---- third_party/cordio/ble-profiles/sources/apps/fit/fit_main.c	2026-04-19 13:30:26.000000000 -0700
-+++ third_party/cordio/ble-profiles/sources/apps/fit/fit_main.c	2026-04-19 13:36:17.000000000 -0700
+--- third_party/cordio/ble-profiles/sources/apps/fit/fit_main.c
++++ third_party/cordio/ble-profiles/sources/apps/fit/fit_main.c
 @@ -49,6 +49,7 @@
  #include "rscp/rscp_api.h"
  #include "fit_api.h"
@@ -43,7 +43,26 @@
  };
  
  /**************************************************************************************************
-@@ -130,6 +152,15 @@
+@@ -106,12 +128,16 @@
+ };
+ 
+ /*! configurable parameters for security */
++/* Cooper FW 1.21.2.0 in this build does not return HCI_LE_Read_Local_P-256_Public_Key
++ * complete, which stalls GATT db hash after DM reset. Use legacy pairing only. */
+ static const appSecCfg_t fitSecCfg =
+ {
+ #ifndef PAIRING_TEST
+-  DM_AUTH_BOND_FLAG |
++  DM_AUTH_BOND_FLAG,
++#else
++  0,
+ #endif
+-    DM_AUTH_SC_FLAG,    /*! Authentication and bonding flags */
++                                          /*! Authentication and bonding flags */
+   0,                                      /*! Initiator key distribution flags */
+   DM_KEY_DIST_LTK,                        /*! Responder key distribution flags */
+   FALSE,                                  /*! TRUE if Out-of-band pairing data is present */
+@@ -130,6 +156,15 @@
    5                                       /*! Number of update attempts before giving up */
  };
  
@@ -59,7 +78,7 @@
  /*! heart rate measurement configuration */
  static const hrpsCfg_t fitHrpsCfg =
  {
-@@ -204,11 +235,12 @@
+@@ -204,11 +239,12 @@
  static const uint8_t fitScanDataDisc[] =
  {
    /*! device name */
@@ -76,7 +95,7 @@
  };
  
  /**************************************************************************************************
-@@ -222,6 +254,8 @@
+@@ -222,6 +258,8 @@
    FIT_HRS_HRM_CCC_IDX,                    /*! Heart rate service, heart rate monitor characteristic */
    FIT_BATT_LVL_CCC_IDX,                   /*! Battery service, battery level characteristic */
    FIT_RSCS_SM_CCC_IDX,                   /*! Runninc speed and cadence measurement characteristic */
@@ -85,7 +104,7 @@
    FIT_NUM_CCC_IDX
  };
  
-@@ -232,7 +266,9 @@
+@@ -232,7 +270,9 @@
    {GATT_SC_CH_CCC_HDL,    ATT_CLIENT_CFG_INDICATE,  DM_SEC_LEVEL_NONE},   /* FIT_GATT_SC_CCC_IDX */
    {HRS_HRM_CH_CCC_HDL,    ATT_CLIENT_CFG_NOTIFY,    DM_SEC_LEVEL_NONE},   /* FIT_HRS_HRM_CCC_IDX */
    {BATT_LVL_CH_CCC_HDL,   ATT_CLIENT_CFG_NOTIFY,    DM_SEC_LEVEL_NONE},   /* FIT_BATT_LVL_CCC_IDX */
@@ -96,7 +115,7 @@
  };
  
  /**************************************************************************************************
-@@ -244,6 +280,7 @@
+@@ -244,6 +284,7 @@
  
  /* WSF Timer to send running speed and cadence measurement data */
  wsfTimer_t     fitRscmTimer;
@@ -104,7 +123,7 @@
  
  /* Running Speed and Cadence Measurement period - Can be changed at runtime to vary period */
  static uint16_t fitRscmPeriod = FIT_DEFAULT_RSCM_PERIOD;
-@@ -251,6 +288,16 @@
+@@ -251,6 +292,16 @@
  /* Heart Rate Monitor feature flags */
  static uint8_t fitHrmFlags = CH_HRM_FLAGS_VALUE_8BIT | CH_HRM_FLAGS_ENERGY_EXP;
  
@@ -121,7 +140,7 @@
  /*************************************************************************************************/
  /*!
   *  \brief  Application DM callback.
-@@ -418,6 +465,35 @@
+@@ -418,6 +469,35 @@
      }
      return;
    }
@@ -157,7 +176,7 @@
  }
  
  /*************************************************************************************************/
-@@ -439,6 +515,10 @@
+@@ -439,6 +519,10 @@
  
    /* Stop running speed and cadence timer */
    WsfTimerStop(&fitRscmTimer);
@@ -168,7 +187,7 @@
  }
  
  /*************************************************************************************************/
-@@ -461,6 +541,9 @@
+@@ -461,6 +545,9 @@
    AppAdvSetData(APP_ADV_DATA_CONNECTABLE, sizeof(fitAdvDataDisc), (uint8_t *) fitAdvDataDisc);
    AppAdvSetData(APP_SCAN_DATA_CONNECTABLE, sizeof(fitScanDataDisc), (uint8_t *) fitScanDataDisc);
  
@@ -178,7 +197,7 @@
    /* start advertising; automatically set connectable/discoverable mode and bondable mode */
    AppAdvStart(APP_MODE_AUTO_INIT);
  
-@@ -621,6 +704,10 @@
+@@ -621,6 +708,10 @@
        fitSendRunningSpeedMeasurement((dmConnId_t)pMsg->ccc.hdr.param);
        break;
  
@@ -189,7 +208,7 @@
      case FIT_HR_TIMER_IND:
        HrpsProcMsg(&pMsg->hdr);
        break;
-@@ -640,6 +727,7 @@
+@@ -640,6 +731,7 @@
  
      case ATT_MTU_UPDATE_IND:
        APP_TRACE_INFO1("Negotiated MTU %d", ((attEvt_t *)pMsg)->mtu);
@@ -197,7 +216,7 @@
        break;
  
      case DM_RESET_CMPL_IND:
-@@ -688,6 +776,9 @@
+@@ -688,6 +780,9 @@
        break;
  
      case DM_CONN_OPEN_IND:
@@ -207,7 +226,7 @@
        HrpsProcMsg(&pMsg->hdr);
        BasProcMsg(&pMsg->hdr);
        // AppSlaveSecurityReq(1);
-@@ -830,6 +921,7 @@
+@@ -830,6 +925,7 @@
  
    /* Set stack configuration pointers */
    pSmpCfg = (smpCfg_t *) &fitSmpCfg;
@@ -215,13 +234,39 @@
  #ifdef AM_BLE_EATT
    pEattCfg = (eattCfg_t *) &fiteattCfg;
  #endif
-@@ -912,6 +1004,9 @@
+@@ -904,21 +1000,35 @@
+   AppUiBtnRegister(fitBtnCback);
+ 
+   /* Initialize attribute server database */
++  am_util_stdio_printf("[fitstart] >SvcCoreAddGroup\r\n");
+   SvcCoreGattCbackRegister(GattReadCback, GattWriteCback);
+   SvcCoreAddGroup();
++  am_util_stdio_printf("[fitstart] >SvcHrsAddGroup\r\n");
+   SvcHrsCbackRegister(NULL, HrpsWriteCback);
+   SvcHrsAddGroup();
++  am_util_stdio_printf("[fitstart] >SvcDisAddGroup\r\n");
+   SvcDisAddGroup();
++  am_util_stdio_printf("[fitstart] >SvcBattAddGroup\r\n");
    SvcBattCbackRegister(BasReadCback, NULL);
    SvcBattAddGroup();
++  am_util_stdio_printf("[fitstart] >SvcRscsAddGroup\r\n");
    SvcRscsAddGroup();
++  am_util_stdio_printf("[fitstart] >HelloJsonSvcAdd\r\n");
 +  HelloJsonSvcAdd();
++  am_util_stdio_printf("[fitstart] >OpusStreamSvcAdd\r\n");
 +  OpusStreamSvcAdd();
 +  OpusStreamSetPumpCallback(fitOpusPump);
++  am_util_stdio_printf("[fitstart] services added\r\n");
  
    /* Set Service Changed CCCD index. */
    GattSetSvcChangedIdx(FIT_GATT_SC_CCC_IDX);
++  am_util_stdio_printf("[fitstart] svc changed idx set\r\n");
+ 
+   /* Set running speed and cadence features */
+   RscpsSetFeatures(RSCS_ALL_FEATURES);
+ 
+   /* Reset the device */
++  am_util_stdio_printf("[fitstart] DmDevReset...\r\n");
+   DmDevReset();
++  am_util_stdio_printf("[fitstart] DmDevReset returned\r\n");
+ }
