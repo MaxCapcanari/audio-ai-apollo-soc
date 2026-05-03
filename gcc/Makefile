@@ -105,7 +105,7 @@ DEFINES+= -Dgcc
 DEFINES+= -DAM_UTIL_FAULTISR_PRINT
 # KWS is paused while we integrate the new MEMS mic. Code is preserved behind
 # KWS_DISABLE guards in mic_task.c / Makefile — flip this to 0 to re-enable.
-KWS_DISABLE ?= 1
+KWS_DISABLE ?= 0
 ifeq ($(KWS_DISABLE),1)
 DEFINES+= -DKWS_DISABLE
 endif

@@ -42,12 +42,12 @@ static TfLiteTensor                    *s_output      = nullptr;
 alignas(alignof(tflite::MicroInterpreter))
 static uint8_t s_interp_buf[sizeof(tflite::MicroInterpreter)];
 
-// Standard Google Speech Commands / ML Commons KWS label order — matches the
-// order TF's `wav_to_features` / Pete Warden's tutorial uses for tiny_conv /
-// DS-CNN training. If your .tflite was trained with a different order, swap.
+// Label order for the neuralSPOT-bundled KWS DS-CNN model. Verified against
+// neuralSPOT/apps/ai/kws/src/kws_model_settings.h — NOT canonical Google
+// Speech Commands order. "yes" sits at idx 9, "silence" at 10, "unknown" at 11.
 const char *kws_label_names[KWS_NUM_CLASSES] = {
-    "silence", "unknown", "yes", "no", "up", "down",
-    "left", "right", "on", "off", "stop", "go"
+    "down", "go", "left", "no", "off", "on",
+    "right", "stop", "up", "yes", "silence", "unknown"
 };
 
 void kws_init(void) {
@@ -133,6 +133,52 @@ void kws_init(void) {
     am_util_stdio_printf("[kws] Trigger word: \"%s\" (idx %d), threshold %.0f%%\n",
                          kws_label_names[KWS_TRIGGER_IDX],
                          KWS_TRIGGER_IDX, KWS_THRESHOLD * 100.0f);
+}
+
+int kws_run_top2(const float *mfcc_features,
+                 int *top1_idx, float *top1_conf,
+                 int *top2_idx, float *top2_conf) {
+    if (!s_interpreter) return -1;
+
+    const int in_count  = (int)s_input->bytes;
+    const int out_count = (int)s_output->bytes;
+
+    float in_scale = s_input->params.scale;
+    int   in_zp    = s_input->params.zero_point;
+    for (int i = 0; i < in_count; i++) {
+        float q = mfcc_features[i] / in_scale + (float)in_zp;
+        if (q >  127.0f) q =  127.0f;
+        if (q < -128.0f) q = -128.0f;
+        s_input->data.int8[i] = (int8_t)q;
+    }
+
+    if (s_interpreter->Invoke() != kTfLiteOk) {
+        return -1;
+    }
+
+    float out_scale = s_output->params.scale;
+    int   out_zp    = s_output->params.zero_point;
+
+    int   best_idx = 0,  second_idx = 0;
+    float best     = -1e9f, second  = -1e9f;
+    for (int i = 0; i < out_count; i++) {
+        float score = ((float)s_output->data.int8[i] - (float)out_zp) * out_scale;
+        if (score > best) {
+            second     = best;
+            second_idx = best_idx;
+            best       = score;
+            best_idx   = i;
+        } else if (score > second) {
+            second     = score;
+            second_idx = i;
+        }
+    }
+
+    if (top1_idx)  *top1_idx  = best_idx;
+    if (top1_conf) *top1_conf = best;
+    if (top2_idx)  *top2_idx  = second_idx;
+    if (top2_conf) *top2_conf = second;
+    return best_idx;
 }
 
 int kws_run(const float *mfcc_features, float *conf_out) {

@@ -144,6 +144,17 @@ AM_SHARED_RW static uint8_t  g_mfccArena[MFCC_ARENA_BYTES];
 static float                 g_mfccFeatures[KWS_NUM_FRAMES * KWS_NUM_COEFFS];
 static uint32_t              g_mfccFrameCount = 0;
 static ns_mfcc_cfg_t         g_mfccCfg;
+
+// Software gain applied only on the KWS feed — brings the AUDADC PCM into the
+// range Google Speech Commands was trained on without touching the recording
+// path. 4x ≈ +12 dB; saturates to int16 full scale.
+#define KWS_SW_GAIN          2
+
+// Energy gate: peak |sample| over the 1-second KWS window must exceed this to
+// invoke the model. Below it, force-classify as silence — eliminates the
+// "go"/"yes" hallucinations the DS-CNN model emits on AUDADC residual noise.
+#define KWS_PEAK_GATE        2000
+static volatile int32_t      g_kwsWindowPeak = 0;
 #endif
 
 // AUDADC ping+pong contiguous buffer (HAL alternates halves automatically).
@@ -393,8 +404,14 @@ void am_audadc0_isr(void)
 #ifndef KWS_DISABLE
                 else if (g_mode == MODE_LISTENING && g_kwsReadyBuf == 0xFF)
                 {
+                    int32_t kg = (int32_t)s16 * KWS_SW_GAIN;
+                    if (kg >  32767) kg =  32767;
+                    if (kg < -32768) kg = -32768;
+                    int32_t ag = (kg < 0) ? -kg : kg;
+                    if (ag > g_kwsWindowPeak) g_kwsWindowPeak = ag;
+
                     uint32_t wb = g_kwsWriteBuf;
-                    g_kwsBuf[wb][g_kwsWritePos++] = (int16_t)s16;
+                    g_kwsBuf[wb][g_kwsWritePos++] = (int16_t)kg;
                     if (g_kwsWritePos == KWS_FRAME_SAMPLES)
                     {
                         g_kwsWritePos = 0;
@@ -772,12 +789,25 @@ void MicTask(void *pvParameters)
             if (g_mfccFrameCount >= KWS_NUM_FRAMES)
             {
                 g_mfccFrameCount = 0;
+                int32_t winPeak = g_kwsWindowPeak;
+                g_kwsWindowPeak = 0;
 
-                int keyword = kws_run(g_mfccFeatures, &confidence);
-                if (keyword >= 0 && keyword != 0 && keyword != 1)  // skip silence/unknown
+                int keyword = -1;
+                if (winPeak >= KWS_PEAK_GATE)
                 {
-                    am_util_stdio_printf("[kws] \"%s\" %.0f%%\n",
-                                        kws_label_names[keyword], confidence * 100.0f);
+                    int top2_idx = -1;
+                    float top2_conf = 0.0f;
+                    keyword = kws_run_top2(g_mfccFeatures,
+                                           &keyword, &confidence,
+                                           &top2_idx, &top2_conf);
+                    if (keyword >= 0 && keyword != KWS_SILENCE_IDX && keyword != KWS_UNKNOWN_IDX)
+                    {
+                        am_util_stdio_printf("[kws] \"%s\" %.0f%% (2nd=\"%s\" %.0f%%, peak=%ld)\n",
+                                            kws_label_names[keyword], confidence * 100.0f,
+                                            (top2_idx >= 0 ? kws_label_names[top2_idx] : "?"),
+                                            top2_conf * 100.0f,
+                                            (long)winPeak);
+                    }
                 }
                 if (keyword == KWS_TRIGGER_IDX && confidence >= KWS_THRESHOLD)
                 {
