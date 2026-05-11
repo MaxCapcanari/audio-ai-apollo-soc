@@ -56,7 +56,13 @@ PART = apollo4p
 CPU = cortex-m4
 FPU = fpv4-sp-d16
 
-NEURALSPOT_ROOT ?= /Users/maxim/Downloads/neuralSPOT
+ifeq ($(strip $(NEURALSPOT_ROOT)),)
+$(error NEURALSPOT_ROOT is not set. Clone https://github.com/AmbiqAI/neuralSPOT, build it for apollo4p_blue_kxr_evb, then re-run with: make -C gcc NEURALSPOT_ROOT=/path/to/neuralSPOT (or `export NEURALSPOT_ROOT=...` in your shell))
+endif
+ifeq ($(wildcard $(NEURALSPOT_ROOT)/neuralspot/ns-audio/includes-api),)
+$(error NEURALSPOT_ROOT=$(NEURALSPOT_ROOT) does not look like a neuralSPOT checkout (missing neuralspot/ns-audio/includes-api). Check the path)
+endif
+
 NS_BUILD = $(NEURALSPOT_ROOT)/build/apollo4p_blue_kxr_evb/arm-none-eabi
 TFLM_ROOT = $(NEURALSPOT_ROOT)/extern/tensorflow/helia_rt_v1_6_0
 CMSIS_DSP_ROOT = $(NEURALSPOT_ROOT)/extern/CMSIS/CMSIS-DSP-1.16.2
