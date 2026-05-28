@@ -320,6 +320,8 @@ extern uint32_t _sdata;
 extern uint32_t _edata;
 extern uint32_t _sbss;
 extern uint32_t _ebss;
+extern uint32_t _ssram_bss;
+extern uint32_t _esram_bss;
 
 //*****************************************************************************
 //
@@ -376,6 +378,20 @@ Reset_Handler(void)
           "        it      lt\n"
           "        strlt   r2, [r0], #4\n"
           "        blt     zero_loop");
+
+    //
+    // Zero fill the .sram_bss segment (FreeRTOS heap + other shared-SRAM
+    // BSS). Without this, heap_4's pxEnd boots non-NULL and the first
+    // pvPortMalloc walks a garbage free-list.
+    //
+    __asm("    ldr     r0, =_ssram_bss\n"
+          "    ldr     r1, =_esram_bss\n"
+          "    mov     r2, #0\n"
+          "zero_sram_bss_loop:\n"
+          "        cmp     r0, r1\n"
+          "        it      lt\n"
+          "        strlt   r2, [r0], #4\n"
+          "        blt     zero_sram_bss_loop");
 
     //
     // Run C++ static constructors (init_array) before main(). Required for

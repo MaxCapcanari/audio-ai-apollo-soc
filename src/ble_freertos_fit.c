@@ -69,7 +69,7 @@
 //*****************************************************************************
 #include "ble_freertos_fit.h"
 #include "rtos.h"
-#include "fake_opus_audio.h"
+#include "printf_lock.h"
 
 //*****************************************************************************
 //
@@ -131,9 +131,12 @@ main(void)
     am_util_debug_printf("FreeRTOS Fit ------- Example\n");
 
     //
-    // Generate temporary fake Opus payload for BLE integration work.
+    // Initialise the printf mutex BEFORE any task can spawn — otherwise
+    // RadioTask/MicTask race on the SDK's shared g_prfbuf and the
+    // resulting overruns scribble into adjacent .bss state (which on
+    // this build sits next to BLE Cordio's data — breaks advertising).
     //
-    FakeOpusAudioInit();
+    printf_lock_init();
 
     //
     // Run the application.

@@ -56,6 +56,7 @@ PART = apollo4p
 CPU = cortex-m4
 FPU = fpv4-sp-d16
 
+NEURALSPOT_ROOT ?= /Users/maxim/Downloads/neuralSPOT
 ifeq ($(strip $(NEURALSPOT_ROOT)),)
 $(error NEURALSPOT_ROOT is not set. Clone https://github.com/AmbiqAI/neuralSPOT, build it for apollo4p_blue_kxr_evb, then re-run with: make -C gcc NEURALSPOT_ROOT=/path/to/neuralSPOT (or `export NEURALSPOT_ROOT=...` in your shell))
 endif
@@ -256,10 +257,10 @@ SRC += hci_drv_cooper.c
 SRC += hci_vs_cooper.c
 SRC += am_resources.c
 SRC += ble_freertos_fit.c
+SRC += printf_lock.c
 SRC += radio_task.c
 SRC += ble_json_svc.c
 SRC += ble_opus_stream_svc.c
-SRC += fake_opus_audio.c
 SRC += mic_task.c
 SRC += rtos.c
 SRC += hid_main.c
@@ -403,7 +404,7 @@ LIBS += $(NS_BUILD)/neuralspot/ns-audio/ns-audio.a
 LIBS += ./lib/ns-core-noinit.a
 LIBS += $(NS_BUILD)/neuralspot/ns-harness/ns-harness.a
 LIBS += $(NS_BUILD)/neuralspot/ns-utils/ns-utils.a
-LIBS += $(TFLM_ROOT)/lib/libtensorflow-microlite-cm4-gcc-release.a
+LIBS += $(TFLM_ROOT)/lib/libtensorflow-microlite-cm4-gcc-release-with-logs.a
 LIBS += $(CMSIS_DSP_ROOT)/lib/libCMSISDSP-m4-gcc.a
 endif
 
@@ -427,6 +428,10 @@ CXXFLAGS+= $(INCLUDES)
 LFLAGS = -mthumb -mcpu=$(CPU) -mfpu=$(FPU) -mfloat-abi=$(FABI)
 LFLAGS+= -nostartfiles -static
 LFLAGS+= -Wl,--gc-sections,--entry,Reset_Handler,-Map,$(CONFIG)/$(TARGET).map
+# Wrap am_util_stdio_printf so every call goes through the recursive-mutex
+# guard in src/printf_lock.c. Required: SDK's printf uses a single shared
+# g_prfbuf and is not thread-safe.
+LFLAGS+= -Wl,--wrap=am_util_stdio_printf
 LFLAGS+= -Wl,--start-group -lm -lc -lgcc -lnosys $(LIBS) -Wl,--end-group
 LFLAGS+= 
 

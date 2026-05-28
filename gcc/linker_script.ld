@@ -78,8 +78,10 @@ SECTIONS
     {
         . = ALIGN(4);
         _sbss = .;
-        *(.bss)
-        *(.bss*)
+        /* Exclude FreeRTOS heap (~200 KB) from TCM — routed to .sram_bss
+           below so MCU_TCM has room for the KWS tensor arena (.tcm_bss). */
+        *(EXCLUDE_FILE (*heap_4.o) .bss)
+        *(EXCLUDE_FILE (*heap_4.o) .bss*)
         *(COMMON)
         . = ALIGN(4);
         _ebss = .;
@@ -96,9 +98,26 @@ SECTIONS
     .sram_bss (NOLOAD):
     {
         . = ALIGN(4);
+        _ssram_bss = .;
         *(.sram_bss)
+        /* FreeRTOS heap relocated here (was in TCM). heap_4 keeps its
+           metadata vars (xStart, pxEnd, counters) alongside ucHeap and
+           DOES rely on them being zero — the startup zero-loop covers
+           this range via _ssram_bss/_esram_bss. */
+        *heap_4.o(.bss .bss*)
         . = ALIGN(4);
+        _esram_bss = .;
     } > SHARED_SRAM
+
+    /* KWS tensor arena lives here — single-cycle TCM access vs multi-cycle
+       AXI for SHARED_SRAM, cuts CMSIS-NN s8 conv time roughly in half on
+       this MCU. Sized for the chewallow int8 model (179 KB used + headroom). */
+    .tcm_bss (NOLOAD):
+    {
+        . = ALIGN(16);
+        *(.tcm_bss)
+        . = ALIGN(4);
+    } > MCU_TCM
 
     .ARM.attributes 0 : { *(.ARM.attributes) }
 }

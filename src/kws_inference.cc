@@ -23,15 +23,19 @@ void operator delete(void *, std::size_t) noexcept {}
 static_assert(kKwsInputSize  == KWS_INPUT_SIZE,  "Model input size mismatch");
 static_assert(kCategoryCount == KWS_NUM_CLASSES,  "Model class count mismatch");
 
-// Measured peak: ~23 KB on our DS-CNN KWS model. 48 KB gives headroom for
-// future model variants without bloating SHARED_SRAM use.
-#define KWS_TENSOR_ARENA_SIZE (48 * 1024)
+// Chewallow int8 model needs 175 KB measured; 192 KB gives ~10% headroom
+// for future variants without bloating TCM.
+#define KWS_TENSOR_ARENA_SIZE (192 * 1024)
 
-// Tensor arena in SHARED_SRAM — NS_SRAM_BSS expands to the right section attribute
-// for apollo4p + gcc, keeping it out of the 384 KB TCM.
-NS_SRAM_BSS alignas(16) static uint8_t s_arena[KWS_TENSOR_ARENA_SIZE];
+// Tensor arena in TCM (single-cycle CPU access) rather than SHARED_SRAM
+// (multi-cycle AXI fabric). CMSIS-NN s8 conv is access-bound on its int8
+// activation/weight loads, so TCM placement is the largest single-knob
+// speedup we have without retraining. The linker_script.ld routes
+// .tcm_bss to MCU_TCM; in exchange, the FreeRTOS heap was moved out of
+// TCM into .sram_bss to make room.
+__attribute__((section(".tcm_bss"))) alignas(16) static uint8_t s_arena[KWS_TENSOR_ARENA_SIZE];
 
-static tflite::MicroMutableOpResolver<6> s_resolver;
+static tflite::MicroMutableOpResolver<7> s_resolver;
 static const tflite::Model             *s_model      = nullptr;
 static tflite::MicroInterpreter        *s_interpreter = nullptr;
 static TfLiteTensor                    *s_input       = nullptr;
@@ -42,12 +46,10 @@ static TfLiteTensor                    *s_output      = nullptr;
 alignas(alignof(tflite::MicroInterpreter))
 static uint8_t s_interp_buf[sizeof(tflite::MicroInterpreter)];
 
-// Label order for the neuralSPOT-bundled KWS DS-CNN model. Verified against
-// neuralSPOT/apps/ai/kws/src/kws_model_settings.h — NOT canonical Google
-// Speech Commands order. "yes" sits at idx 9, "silence" at 10, "unknown" at 11.
+// Chewallow binary classifier. Mirrors kCategoryLabels in
+// kws/kws_model_settings.h. Keep these two in sync.
 const char *kws_label_names[KWS_NUM_CLASSES] = {
-    "down", "go", "left", "no", "off", "on",
-    "right", "stop", "up", "yes", "silence", "unknown"
+    "nothing", "chewallow"
 };
 
 void kws_init(void) {
@@ -69,12 +71,13 @@ void kws_init(void) {
     }
 
     am_util_stdio_printf("[kws] init: AddOps\r\n");
-    s_resolver.AddFullyConnected();
     s_resolver.AddConv2D();
-    s_resolver.AddDepthwiseConv2D();
-    s_resolver.AddReshape();
+    s_resolver.AddMul();
+    s_resolver.AddAdd();
+    s_resolver.AddMaxPool2D();
+    s_resolver.AddMean();
+    s_resolver.AddFullyConnected();
     s_resolver.AddSoftmax();
-    s_resolver.AddAveragePool2D();
 
     am_util_stdio_printf("[kws] init: ctor MicroInterpreter\r\n");
     s_interpreter = new(s_interp_buf) tflite::MicroInterpreter(
@@ -135,34 +138,66 @@ void kws_init(void) {
                          KWS_TRIGGER_IDX, KWS_THRESHOLD * 100.0f);
 }
 
+// Element count from dims — bytes scales with the tensor's element size
+// (4× for float32 vs int8), so looping on `bytes` would overrun a float
+// tensor and only touch the low byte of each element.
+static int tensor_element_count(const TfLiteTensor *t) {
+    if (!t || !t->dims) return 0;
+    int n = 1;
+    for (int i = 0; i < t->dims->size; i++) n *= t->dims->data[i];
+    return n;
+}
+
+// Returns 0 on success, -1 if input tensor type is unsupported.
+static int write_input(const float *mfcc_features) {
+    const int n = tensor_element_count(s_input);
+    if (s_input->type == kTfLiteFloat32) {
+        for (int i = 0; i < n; i++) s_input->data.f[i] = mfcc_features[i];
+        return 0;
+    }
+    if (s_input->type == kTfLiteInt8) {
+        float scale = s_input->params.scale;
+        int   zp    = s_input->params.zero_point;
+        for (int i = 0; i < n; i++) {
+            float q = mfcc_features[i] / scale + (float)zp;
+            if (q >  127.0f) q =  127.0f;
+            if (q < -128.0f) q = -128.0f;
+            s_input->data.int8[i] = (int8_t)q;
+        }
+        return 0;
+    }
+    return -1;
+}
+
+// Reads class i score in real units (post-softmax probability for our model).
+// Returns NAN if output type is unsupported.
+static float read_output_score(int i) {
+    if (s_output->type == kTfLiteFloat32) {
+        return s_output->data.f[i];
+    }
+    if (s_output->type == kTfLiteInt8) {
+        return ((float)s_output->data.int8[i] - (float)s_output->params.zero_point)
+               * s_output->params.scale;
+    }
+    return __builtin_nanf("");
+}
+
 int kws_run_top2(const float *mfcc_features,
                  int *top1_idx, float *top1_conf,
                  int *top2_idx, float *top2_conf) {
-    if (!s_interpreter) return -1;
+    if (!s_interpreter || !s_input || !s_output) return -1;
 
-    const int in_count  = (int)s_input->bytes;
-    const int out_count = (int)s_output->bytes;
-
-    float in_scale = s_input->params.scale;
-    int   in_zp    = s_input->params.zero_point;
-    for (int i = 0; i < in_count; i++) {
-        float q = mfcc_features[i] / in_scale + (float)in_zp;
-        if (q >  127.0f) q =  127.0f;
-        if (q < -128.0f) q = -128.0f;
-        s_input->data.int8[i] = (int8_t)q;
-    }
+    if (write_input(mfcc_features) != 0) return -1;
 
     if (s_interpreter->Invoke() != kTfLiteOk) {
         return -1;
     }
 
-    float out_scale = s_output->params.scale;
-    int   out_zp    = s_output->params.zero_point;
-
+    const int out_count = tensor_element_count(s_output);
     int   best_idx = 0,  second_idx = 0;
     float best     = -1e9f, second  = -1e9f;
     for (int i = 0; i < out_count; i++) {
-        float score = ((float)s_output->data.int8[i] - (float)out_zp) * out_scale;
+        float score = read_output_score(i);
         if (score > best) {
             second     = best;
             second_idx = best_idx;
@@ -182,36 +217,20 @@ int kws_run_top2(const float *mfcc_features,
 }
 
 int kws_run(const float *mfcc_features, float *conf_out) {
-    if (!s_interpreter) return -1;
+    if (!s_interpreter || !s_input || !s_output) return -1;
 
-    // Clamp loops to the tensor's own byte counts. Writing past the input
-    // would clobber adjacent tensor metadata in the arena and fault on the
-    // next read of s_output->data.
-    const int in_count  = (int)s_input->bytes;
-    const int out_count = (int)s_output->bytes;
-
-    float in_scale = s_input->params.scale;
-    int   in_zp    = s_input->params.zero_point;
-    for (int i = 0; i < in_count; i++) {
-        float q = mfcc_features[i] / in_scale + (float)in_zp;
-        if (q >  127.0f) q =  127.0f;
-        if (q < -128.0f) q = -128.0f;
-        s_input->data.int8[i] = (int8_t)q;
-    }
+    if (write_input(mfcc_features) != 0) return -1;
 
     if (s_interpreter->Invoke() != kTfLiteOk) {
         am_util_stdio_printf("[kws] Invoke failed\n");
         return -1;
     }
 
-    // Dequantize output and find best class
-    float out_scale = s_output->params.scale;
-    int   out_zp    = s_output->params.zero_point;
-
+    const int out_count = tensor_element_count(s_output);
     int   best_idx   = 0;
     float best_score = -1.0f;
     for (int i = 0; i < out_count; i++) {
-        float score = ((float)s_output->data.int8[i] - (float)out_zp) * out_scale;
+        float score = read_output_score(i);
         if (score > best_score) {
             best_score = score;
             best_idx   = i;

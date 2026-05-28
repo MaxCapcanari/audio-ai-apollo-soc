@@ -7,16 +7,14 @@
 extern "C" {
 #endif
 
-#define KWS_NUM_FRAMES      49
-#define KWS_NUM_COEFFS      10
-#define KWS_INPUT_SIZE      (KWS_NUM_FRAMES * KWS_NUM_COEFFS)  // 490
-#define KWS_NUM_CLASSES     12
+#define KWS_NUM_FRAMES      250
+#define KWS_NUM_COEFFS      22
+#define KWS_INPUT_SIZE      (KWS_NUM_FRAMES * KWS_NUM_COEFFS)  // 5500
+#define KWS_NUM_CLASSES     2
 
-// neuralSPOT KWS DS-CNN model label order (NOT Google canonical):
-// 0=down 1=go 2=left 3=no 4=off 5=on 6=right 7=stop 8=up 9=yes 10=silence 11=unknown
-#define KWS_TRIGGER_IDX     9   // "yes"
-#define KWS_SILENCE_IDX     10
-#define KWS_UNKNOWN_IDX     11
+// Chewallow binary classifier label order (matches kCategoryLabels in
+// kws/kws_model_settings.h): 0=nothing 1=chewallow.
+#define KWS_TRIGGER_IDX     1   // "chewallow"
 #define KWS_THRESHOLD       0.80f
 
 extern const char *kws_label_names[KWS_NUM_CLASSES];
