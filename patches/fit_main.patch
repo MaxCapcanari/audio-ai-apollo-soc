@@ -216,7 +216,7 @@
        break;
  
      case DM_RESET_CMPL_IND:
-@@ -688,6 +780,9 @@
+@@ -688,9 +780,24 @@
        break;
  
      case DM_CONN_OPEN_IND:
@@ -226,7 +226,22 @@
        HrpsProcMsg(&pMsg->hdr);
        BasProcMsg(&pMsg->hdr);
        // AppSlaveSecurityReq(1);
-@@ -830,6 +925,7 @@
++
++      /* Force-request LE Data Length Extension regardless of what the remote
++       * features read claimed. Some phones (or the EM9304 HCI integration)
++       * mis-report the feature bit; if the remote actually supports DLE the
++       * link layer will negotiate it, otherwise the request is harmless.
++       * Without DLE, MTU-247 notifications fragment into ~8 ACL packets each
++       * and the radio's outbound queue overflows mid-window. */
++      am_util_stdio_printf("DLE: requesting txOctets=%u txTime=%u\r\n",
++                           (unsigned)LE_MAX_TX_SIZE, (unsigned)LE_MAX_TX_TIME);
++      DmConnSetDataLen((dmConnId_t)pMsg->hdr.param,
++                       LE_MAX_TX_SIZE, LE_MAX_TX_TIME);
++
+       uiEvent = APP_UI_CONN_OPEN;
+       if(g_CustHandleID != 0xFF)
+       {
+@@ -830,6 +937,7 @@
  
    /* Set stack configuration pointers */
    pSmpCfg = (smpCfg_t *) &fitSmpCfg;
@@ -234,7 +249,7 @@
  #ifdef AM_BLE_EATT
    pEattCfg = (eattCfg_t *) &fiteattCfg;
  #endif
-@@ -904,21 +1000,35 @@
+@@ -904,21 +1012,35 @@
    AppUiBtnRegister(fitBtnCback);
  
    /* Initialize attribute server database */
