@@ -29,6 +29,15 @@
 #define OPUS_ACK_TIMEOUT_MS     5000U
 #define OPUS_MAX_MISSING        64U
 
+/* Set to 1 to enable per-packet "[opus tx] idx=N/M flags=0x.. len=.." UART
+ * logs from opusSendPacketAtIndex(). Useful for diagnosing whether the
+ * firmware actually pushed every packet down to Cordio. Off by default
+ * because each line takes a few ms to emit at 115200 baud, which is
+ * significant relative to the 50 ms inter-packet pacing. */
+#ifndef OPUS_VERBOSE_TX
+#define OPUS_VERBOSE_TX         0
+#endif
+
 /* ------- GATT service data ------- */
 static bool_t g_opusGroupAdded = FALSE;
 
@@ -131,6 +140,12 @@ static uint16_t g_missingList[OPUS_MAX_MISSING];
 static uint16_t g_missingCount       = 0;
 static uint16_t g_missingIdx         = 0;
 
+/* Auto-send: set TRUE by OpusStreamStartAuto() when a recording is ready
+ * but no phone is connected (or notifications not yet enabled). The pending
+ * stream is flushed as soon as CCC enable arrives. Cleared on transfer
+ * complete or on explicit stream_start (manual replay). */
+static bool_t g_pendingAutoStart = FALSE;
+
 /* ------- Pump callback ------- */
 static opus_pump_fn_t g_pumpFn = NULL;
 
@@ -224,6 +239,15 @@ static void opusSendPacketAtIndex(uint16_t pktIdx, uint8_t extraFlags)
 
   opusValLen = (uint16_t)(OPUS_META_BYTES + chunkLen);
   AttsSetAttr(OPUS_VAL_HDL, opusValLen, opusValBuf);
+
+#if OPUS_VERBOSE_TX
+  am_util_stdio_printf("[opus tx] idx=%u/%u flags=0x%02X len=%u\r\n",
+                       (unsigned)pktIdx,
+                       (unsigned)g_totalPackets,
+                       (unsigned)flags,
+                       (unsigned)opusValLen);
+#endif
+
   AttsHandleValueNtf(g_connId, OPUS_VAL_HDL, opusValLen, opusValBuf);
 }
 
@@ -296,6 +320,36 @@ static uint16_t jsonGetIntArray(const char *json, const char *key,
   return count;
 }
 
+/* Begin (or restart) a window-mode transfer at packet 0. Returns TRUE if a
+ * stream was actually kicked off, FALSE if there is no recording to send.
+ * Caller must ensure notifications are enabled. */
+static bool_t opusKickOffStream(uint16_t windowSize)
+{
+  uint32_t totalLen;
+  (void)MicTaskGetOpusData(&totalLen);
+  if (totalLen == 0U)
+  {
+    return FALSE;
+  }
+
+  opusRecomputeStream();
+  if (g_totalPackets == 0U)
+  {
+    return FALSE;
+  }
+
+  g_windowSize  = (windowSize == 0U) ? OPUS_DEFAULT_WINDOW : windowSize;
+  g_windowStart = 0;
+  g_windowSent  = 0;
+  g_streamState = STREAM_SENDING_WINDOW;
+
+  am_util_debug_printf("OpusStream: start (window=%u, packets=%u, bytes=%u)\r\n",
+                       (unsigned)g_windowSize, (unsigned)g_totalPackets,
+                       (unsigned)totalLen);
+  opusSchedule(1);
+  return TRUE;
+}
+
 /* ======================================================================
  *  Public API
  * ====================================================================== */
@@ -303,6 +357,34 @@ static uint16_t jsonGetIntArray(const char *json, const char *key,
 void OpusStreamSetPumpCallback(opus_pump_fn_t fn)
 {
   g_pumpFn = fn;
+}
+
+void OpusStreamStartAuto(void)
+{
+  uint32_t totalLen;
+  (void)MicTaskGetOpusData(&totalLen);
+  if (totalLen == 0U)
+  {
+    g_pendingAutoStart = FALSE;
+    return;
+  }
+
+  /* A new recording is ready — any prior in-flight stream is now stale
+   * (it referenced the previous g_opusBuf contents). */
+  g_streamState = STREAM_IDLE;
+
+  if (g_notifyEnabled && g_connId != DM_CONN_ID_NONE)
+  {
+    am_util_debug_printf("OpusStream: auto-send (recording ready, phone connected)\r\n");
+    if (opusKickOffStream(OPUS_DEFAULT_WINDOW))
+    {
+      g_pendingAutoStart = FALSE;
+      return;
+    }
+  }
+
+  am_util_debug_printf("OpusStream: auto-send pending (waiting for phone)\r\n");
+  g_pendingAutoStart = TRUE;
 }
 
 void OpusStreamSvcAdd(void)
@@ -332,6 +414,16 @@ void OpusStreamCccState(dmConnId_t connId, bool_t enabled)
     opusRecomputeStream();
     am_util_debug_printf("OpusStream: notify enabled (connId=%d, mtu=%u, payload=%u)\r\n",
                          connId, (unsigned)g_attMtu, (unsigned)g_payloadBytes);
+
+    /* Flush any recording that finished encoding before the phone was ready. */
+    if (g_pendingAutoStart)
+    {
+      am_util_debug_printf("OpusStream: flushing pending recording\r\n");
+      if (opusKickOffStream(OPUS_DEFAULT_WINDOW))
+      {
+        g_pendingAutoStart = FALSE;
+      }
+    }
   }
   else
   {
@@ -390,7 +482,8 @@ bool_t OpusStreamOnJsonCmd(const char *json, uint16_t len)
     return FALSE;
   }
 
-  /* ---- stream_start ---- */
+  /* ---- stream_start (manual replay; auto-send happens via
+   *      OpusStreamStartAuto + OpusStreamCccState) ---- */
   if (jsonMatchStr(json, "cmd", "stream_start"))
   {
     int win = 0;
@@ -399,25 +492,12 @@ bool_t OpusStreamOnJsonCmd(const char *json, uint16_t len)
       win = OPUS_DEFAULT_WINDOW;
     }
 
-    opusRecomputeStream();
-
-    uint32_t totalLen;
-    (void)MicTaskGetOpusData(&totalLen);
-    if (totalLen == 0U)
+    g_pendingAutoStart = FALSE;
+    if (!opusKickOffStream((uint16_t)win))
     {
       am_util_debug_printf("OpusStream: stream_start but no recording\r\n");
       return FALSE;
     }
-
-    g_windowSize  = (uint16_t)win;
-    g_windowStart = 0;
-    g_windowSent  = 0;
-    g_streamState = STREAM_SENDING_WINDOW;
-
-    am_util_debug_printf("OpusStream: start (window=%u, packets=%u, bytes=%u)\r\n",
-                         (unsigned)g_windowSize, (unsigned)g_totalPackets,
-                         (unsigned)totalLen);
-    opusSchedule(1);
     return TRUE;
   }
 
@@ -437,7 +517,8 @@ bool_t OpusStreamOnJsonCmd(const char *json, uint16_t len)
 
     if ((uint16_t)next >= g_totalPackets)
     {
-      g_streamState = STREAM_IDLE;
+      g_streamState      = STREAM_IDLE;
+      g_pendingAutoStart = FALSE;
       opusSchedule(0);
       am_util_debug_printf("OpusStream: transfer complete\r\n");
       return TRUE;

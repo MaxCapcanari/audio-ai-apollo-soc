@@ -41,6 +41,7 @@
 #include "task.h"
 
 #include "mic_task.h"
+#include "ble_opus_stream_svc.h"  // OpusStreamStartAuto — auto-send on recording complete
 #include "ae_api.h"         // Ambiq Opus encoder (audio_enc_init / audio_enc_encode_frame)
 #ifndef KWS_DISABLE
 #include "kws_inference.h"  // TFLite KWS wrapper
@@ -1104,6 +1105,16 @@ void MicTask(void *pvParameters)
             am_util_stdio_printf("[mic] Opus encode done: %lu bytes (~%lu kbit/s)\n",
                                  (unsigned long)opusBytes,
                                  (unsigned long)((opusBytes * 8) / REC_SECONDS / 1000));
+
+            // Auto-send the new recording to the phone. If a phone is connected
+            // with notifications enabled the stream starts immediately; otherwise
+            // the recording is held and will flush as soon as the phone enables
+            // notifications on the Opus characteristic.
+            if (opusBytes > 0)
+            {
+                OpusStreamStartAuto();
+            }
+
             am_util_stdio_printf("[mic] Press short=play (PCM), hold 2s=test tone.\n");
 #ifndef KWS_DISABLE
             g_mfccFrameCount = 0;
