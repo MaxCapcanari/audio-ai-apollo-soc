@@ -25,8 +25,8 @@
 #define OPUS_FLAG_END           0x02U
 #define OPUS_FLAG_WINDOW_END    0x04U
 #define OPUS_DEFAULT_WINDOW     20U
-#define OPUS_INTER_PKT_DELAY_MS 50U
-#define OPUS_ACK_TIMEOUT_MS     5000U
+#define OPUS_INTER_PKT_DELAY_MS 20U
+#define OPUS_ACK_TIMEOUT_MS     30000U
 #define OPUS_MAX_MISSING        64U
 
 /* Set to 1 to enable per-packet "[opus tx] idx=N/M flags=0x.. len=.." UART

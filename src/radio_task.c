@@ -121,18 +121,27 @@ void HelloJsonSvcAdd(void);
 // default. Or it may cause WSF buffer pool initialization failure.
 
 // Memory for the buffer pool
-// Pool 4 (264 bytes * 8) handles MTU-247 notifications.
+// Pool 4 (264 bytes * 24) handles MTU-247 notifications. Bumped from 8 to 24
+// to absorb bursts during fast Opus streaming (8 ms inter-packet pacing × 20
+// packets per window). At 8 buffers we were silently dropping the tail of
+// every window because Cordio couldn't allocate ACL packet buffers faster
+// than the EM9304 returned them via HCI Num_Completed_Packets. Symptom in
+// the UART log was "WsfBufAlloc failed len:229" lines and tail-of-window
+// NACK lists from the phone.
+// Pool 2 (32 bytes * 16) bumped from 4 to 16 for the same reason — the
+// control-plane (ATT write responses, signaling) was also failing during
+// the burst. Symptom: "WsfBufAlloc failed len:20" / "len:24".
 // Pool 6 (400 bytes * 2) covers AttsCalculateDbHash() which walks all GATT
 // attributes and allocates one flat buffer (~362 bytes with our 7-service set:
 // GAP42 + GATT46 + HRS37 + DIS87 + BATT19 + RSCS37 + JSON47 + Opus47 = 362).
 // Must be >= measured peak; 400 gives headroom for future service additions.
 static uint32_t g_pui32BufMem[
-    (WSF_BUF_POOLS * 16 + 16 * 8 + 32 * 4 + 64 * 6 + 264 * 8 + 280 * 6 + 400 * 2) /
+    (WSF_BUF_POOLS * 16 + 16 * 8 + 32 * 16 + 64 * 6 + 264 * 24 + 280 * 6 + 400 * 2) /
     sizeof(uint32_t)];
 
 // Pool descriptor — sizes must be multiples of 8.
 static wsfBufPoolDesc_t g_psPoolDescriptors[WSF_BUF_POOLS] = {
-    {16, 8}, {32, 4}, {64, 6}, {264, 8}, {280, 6}, {400, 2}};
+    {16, 8}, {32, 16}, {64, 6}, {264, 24}, {280, 6}, {400, 2}};
 
 
 //*****************************************************************************
