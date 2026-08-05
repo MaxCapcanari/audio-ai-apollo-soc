@@ -51,6 +51,7 @@
 #include "ae_api.h"         // Ambiq Opus encoder (audio_enc_init / audio_enc_encode_frame)
 //#include "ns_opus_port.h"
 #include "opus.h"
+#include "opus_private.h"    // near your other includes
 #ifndef KWS_DISABLE
 #include "kws_inference.h"  // TFLite KWS wrapper
 #include "ns_audio_mfcc.h"  // MFCC feature extraction
@@ -155,7 +156,7 @@
 #define OPUS_FRAME_BYTES    80
 #define OPUS_NUM_FRAMES     (REC_SECONDS * 50)
 #define OPUS_BUF_BYTES      (OPUS_NUM_FRAMES * OPUS_FRAME_BYTES)
-#define OPUS_ENC_MEM_WORDS  4096          // 16 KB; trim after reading printed size
+#define OPUS_ENC_MEM_WORDS  6400          // 25600 bytes; encoder needs 24544
 static uint32_t g_encMem[OPUS_ENC_MEM_WORDS];
 
 // Resampler steps in 16.16 Q-format.
@@ -1115,6 +1116,8 @@ void MicTask(void *pvParameters)
 
             am_util_stdio_printf("[mic] Encoding %lu Opus frames...\n",
                                  (unsigned long)totalFrames);
+			TickType_t encStartTick = xTaskGetTickCount();
+			
 #if USE_OPUS14
 			static OpusEncoder *g_enc = NULL;
 			if (g_enc == NULL)
@@ -1135,14 +1138,17 @@ void MicTask(void *pvParameters)
 				opus_encoder_ctl(g_enc, OPUS_SET_BITRATE(32000));
 				opus_encoder_ctl(g_enc, OPUS_SET_VBR(0));
 				opus_encoder_ctl(g_enc, OPUS_SET_VBR_CONSTRAINT(0));
-				opus_encoder_ctl(g_enc, OPUS_SET_COMPLEXITY(3));
+				opus_encoder_ctl(g_enc, OPUS_SET_COMPLEXITY(0));
 				opus_encoder_ctl(g_enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
 				opus_encoder_ctl(g_enc, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_WIDEBAND));
+				opus_encoder_ctl(g_enc, OPUS_SET_FORCE_MODE(MODE_CELT_ONLY));
 			}
 #else
 				audio_enc_init(0);
 #endif
 
+            TickType_t initDoneTick = xTaskGetTickCount();
+			
             uint32_t opusBytes = 0;
             for (uint32_t f = 0; f < totalFrames; f++)
             {
@@ -1161,10 +1167,25 @@ void MicTask(void *pvParameters)
                 if (n <= 0 || opusBytes + n > OPUS_BUF_BYTES) break;
                 opusBytes += (uint32_t)n;
             }
+			
+			TickType_t encDoneTick = xTaskGetTickCount();
             g_opusLen = opusBytes;
+			
+			uint32_t initMs   = (uint32_t)(initDoneTick - encStartTick);
+			uint32_t encodeMs = (uint32_t)(encDoneTick - initDoneTick);
+			uint32_t totalMs  = (uint32_t)(encDoneTick - encStartTick);
+			
             am_util_stdio_printf("[mic] Opus encode done: %lu bytes (~%lu kbit/s)\n",
                                  (unsigned long)opusBytes,
                                  (unsigned long)((opusBytes * 8) / REC_SECONDS / 1000));
+								 
+			am_util_stdio_printf("[mic] Encode timing: init=%lu ms, encode=%lu ms, total=%lu ms (%lu frames, %lu us/frame)\n",
+                                 (unsigned long)initMs,
+                                 (unsigned long)encodeMs,
+                                 (unsigned long)totalMs,
+                                 (unsigned long)totalFrames,
+                                 (unsigned long)(totalFrames > 0 ? (encodeMs * 1000UL) / totalFrames : 0));
+			
             am_util_stdio_printf("[mic] Press short=play (PCM), hold 2s=test tone.\n");
 #ifndef KWS_DISABLE
             g_mfccFrameCount = 0;

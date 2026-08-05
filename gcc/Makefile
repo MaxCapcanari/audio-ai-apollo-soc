@@ -109,6 +109,11 @@ DEFINES+= -DAM_PART_APOLLO4P
 DEFINES+= -DAM_FREERTOS
 DEFINES+= -Dgcc
 DEFINES+= -DAM_UTIL_FAULTISR_PRINT
+
+DEFINES+= -DFIXED_POINT
+DEFINES+= -DVAR_ARRAYS
+DEFINES+= -DOPUS_BUILD
+
 # KWS is paused while we integrate the new MEMS mic. Code is preserved behind
 # KWS_DISABLE guards in mic_task.c / Makefile — flip this to 0 to re-enable.
 KWS_DISABLE ?= 0
@@ -164,6 +169,10 @@ INCLUDES+= -I$(NEURALSPOT_ROOT)/neuralspot/ns-utils/includes-api
 INCLUDES+= -I$(NEURALSPOT_ROOT)/neuralspot/ns-audio/includes-api
 INCLUDES+= -I$(NEURALSPOT_ROOT)/extern/codecs/opus1.4/src
 INCLUDES+= -I$(NEURALSPOT_ROOT)/extern/codecs/opus1.4/src/include
+INCLUDES+= -I$(NEURALSPOT_ROOT)/extern/codecs/opus1.4/src/src
+INCLUDES+= -I$(NEURALSPOT_ROOT)/extern/codecs/opus1.4/src/celt
+INCLUDES+= -I$(NEURALSPOT_ROOT)/extern/codecs/opus1.4/src/silk
+INCLUDES+= -I$(NEURALSPOT_ROOT)/extern/codecs/opus1.4/src/silk/fixed
 INCLUDES+= -I$(TFLM_ROOT)
 INCLUDES+= -I$(TFLM_ROOT)/third_party/flatbuffers/include
 INCLUDES+= -I$(TFLM_ROOT)/third_party/gemmlowp
