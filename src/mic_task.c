@@ -49,6 +49,8 @@
 
 #include "mic_task.h"
 #include "ae_api.h"         // Ambiq Opus encoder (audio_enc_init / audio_enc_encode_frame)
+//#include "ns_opus_port.h"
+#include "opus.h"
 #ifndef KWS_DISABLE
 #include "kws_inference.h"  // TFLite KWS wrapper
 #include "ns_audio_mfcc.h"  // MFCC feature extraction
@@ -148,10 +150,13 @@
 #define REC_PCM_SAMPLES     (REC_PCM_RATE * REC_SECONDS)
 
 // Opus encoder framing (fixed by SDK library: 20 ms @ 16 kHz, CBR 32 kbit/s)
+#define USE_OPUS14          1     // 1 = neuralSPOT opus1.4 (fixed-point), 0 = Ambiq ae_api blob
 #define OPUS_FRAME_SAMPLES  320
 #define OPUS_FRAME_BYTES    80
 #define OPUS_NUM_FRAMES     (REC_SECONDS * 50)
 #define OPUS_BUF_BYTES      (OPUS_NUM_FRAMES * OPUS_FRAME_BYTES)
+#define OPUS_ENC_MEM_WORDS  4096          // 16 KB; trim after reading printed size
+static uint32_t g_encMem[OPUS_ENC_MEM_WORDS];
 
 // Resampler steps in 16.16 Q-format.
 //   Capture:  out=16000 from in=23438 -> step = 23438/16000 ~ 1.4649
@@ -1110,15 +1115,49 @@ void MicTask(void *pvParameters)
 
             am_util_stdio_printf("[mic] Encoding %lu Opus frames...\n",
                                  (unsigned long)totalFrames);
-            audio_enc_init(0);
+#if USE_OPUS14
+			static OpusEncoder *g_enc = NULL;
+			if (g_enc == NULL)
+			{
+				int encSize = opus_encoder_get_size(1);
+				am_util_stdio_printf("[mic] opus encoder size: %d bytes (have %d)\n",
+									 encSize, (int)sizeof(g_encMem));
+				if (encSize > (int)sizeof(g_encMem)) {
+					am_util_stdio_printf("[mic] ERROR: encoder buffer too small\n");
+					return;   // or your existing error path
+				}
+				g_enc = (OpusEncoder *)g_encMem;
+				int err = opus_encoder_init(g_enc, 16000, 1, OPUS_APPLICATION_VOIP);
+				if (err != OPUS_OK) {
+					am_util_stdio_printf("[mic] opus_encoder_init failed: %d\n", err);
+					return;
+				}
+				opus_encoder_ctl(g_enc, OPUS_SET_BITRATE(32000));
+				opus_encoder_ctl(g_enc, OPUS_SET_VBR(0));
+				opus_encoder_ctl(g_enc, OPUS_SET_VBR_CONSTRAINT(0));
+				opus_encoder_ctl(g_enc, OPUS_SET_COMPLEXITY(3));
+				opus_encoder_ctl(g_enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+				opus_encoder_ctl(g_enc, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_WIDEBAND));
+			}
+#else
+				audio_enc_init(0);
+#endif
 
             uint32_t opusBytes = 0;
             for (uint32_t f = 0; f < totalFrames; f++)
             {
+#if USE_OPUS14
+                int n = opus_encode(g_enc,
+                            (const opus_int16 *)&g_pcmBuf[f * OPUS_FRAME_SAMPLES],
+                            OPUS_FRAME_SAMPLES,
+                            &g_opusBuf[opusBytes],
+                            OPUS_BUF_BYTES - opusBytes);
+#else
                 int n = audio_enc_encode_frame(
                             (short *)&g_pcmBuf[f * OPUS_FRAME_SAMPLES],
                             OPUS_FRAME_SAMPLES,
                             &g_opusBuf[opusBytes]);
+#endif
                 if (n <= 0 || opusBytes + n > OPUS_BUF_BYTES) break;
                 opusBytes += (uint32_t)n;
             }

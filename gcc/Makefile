@@ -162,6 +162,8 @@ INCLUDES+= -I$(NEURALSPOT_ROOT)/neuralspot/ns-core/includes-api
 INCLUDES+= -I$(NEURALSPOT_ROOT)/neuralspot/ns-harness/includes-api
 INCLUDES+= -I$(NEURALSPOT_ROOT)/neuralspot/ns-utils/includes-api
 INCLUDES+= -I$(NEURALSPOT_ROOT)/neuralspot/ns-audio/includes-api
+INCLUDES+= -I$(NEURALSPOT_ROOT)/extern/codecs/opus1.4/src
+INCLUDES+= -I$(NEURALSPOT_ROOT)/extern/codecs/opus1.4/src/include
 INCLUDES+= -I$(TFLM_ROOT)
 INCLUDES+= -I$(TFLM_ROOT)/third_party/flatbuffers/include
 INCLUDES+= -I$(TFLM_ROOT)/third_party/gemmlowp
@@ -397,7 +399,7 @@ DEPS+= $(ASRC:%.s=$(CONFIG)/%.d)
 
 LIBS = ../../../../../../mcu/apollo4p/hal/mcu/gcc/bin/libam_hal.a
 LIBS += ../../../../bsp/gcc/bin/libam_bsp.a
-LIBS += ../../../../../../ambiq_ble/profiles/volecommon/codec/opus/gcc/libopus.a
+# LIBS += ../../../../../../ambiq_ble/profiles/volecommon/codec/opus/gcc/libopus.a
 ifneq ($(KWS_DISABLE),1)
 LIBS += $(NS_BUILD)/extern/codecs/opus1.4/opus14.a
 LIBS += $(NS_BUILD)/neuralspot/ns-audio/ns-audio.a
