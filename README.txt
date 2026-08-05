@@ -52,3 +52,6 @@ so others get your changes:
     > patches/fit_main.patch
 
 Keep a copy of the unmodified SDK fit_main.c as your diff baseline.
+
+HYER after patching, you need to manually update fit_main.c to improve opus audio download speed over BLE. Look at the "fitUpdateCfg change to fit_main.c.txt" file for more detail!
+

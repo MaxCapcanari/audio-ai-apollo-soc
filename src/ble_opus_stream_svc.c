@@ -3,6 +3,7 @@
 
 #include "wsf_types.h"
 #include "att_api.h"
+#include "att_defs.h"
 #include "dm_api.h"
 
 #include "am_util.h"
@@ -19,15 +20,32 @@
 /* ------- Protocol constants ------- */
 #define OPUS_META_BYTES         10U
 #define OPUS_MIN_ATT_MTU        23U
-#define OPUS_MAX_AUDIO_PAYLOAD  200U
+#define OPUS_MAX_AUDIO_PAYLOAD  234U  // was 200
 #define OPUS_ATT_HDR_BYTES      3U
 #define OPUS_FLAG_START         0x01U
 #define OPUS_FLAG_END           0x02U
 #define OPUS_FLAG_WINDOW_END    0x04U
 #define OPUS_DEFAULT_WINDOW     20U
-#define OPUS_INTER_PKT_DELAY_MS 50U
+/* Paced to the BLE connection interval. AttsHandleValueNtf() returns void and
+ * silently drops notifications when sent faster than the link can carry them.
+ *
+ * Requires fitUpdateCfg in fit_main.c set to interval 12-24, latency 0 --
+ * with the stock 48-60/latency-4 profile the floor is 40 ms.
+ *
+ * Measured, 200-packet transfers, 8 runs each, all nacks=0:
+ *   30 ms -> 6.2 s
+ *   20 ms -> 5.7 s   (anomalous; beats against the connection interval)
+ *   15 ms -> 2.8 s   <- link capacity reached here
+ *   10 ms -> 2.8 s   (no gain, less margin)
+ *    5 ms -> fails
+ */
+#define OPUS_INTER_PKT_DELAY_MS 15U  //was 15U, 3U choked.
 #define OPUS_ACK_TIMEOUT_MS     5000U
 #define OPUS_MAX_MISSING        64U
+
+/* How long to wait before retrying after ATT pool exhaustion. Short, because
+ * we are waiting for buffers to drain, not pacing deliberately. */
+#define OPUS_RETRY_DELAY_MS     3U
 
 /* ------- GATT service data ------- */
 static bool_t g_opusGroupAdded = FALSE;
@@ -131,6 +149,11 @@ static uint16_t g_missingList[OPUS_MAX_MISSING];
 static uint16_t g_missingCount       = 0;
 static uint16_t g_missingIdx         = 0;
 
+/* Counts how often the ATT pool was full. Useful for tuning the delay: if this
+ * stays at zero the delay could come down; if it is large the link is
+ * saturated and the delay is doing no harm. */
+static uint32_t g_txBackpressure = 0;
+
 /* ------- Pump callback ------- */
 static opus_pump_fn_t g_pumpFn = NULL;
 
@@ -178,7 +201,14 @@ static void opusSchedule(uint16_t delayMs)
 }
 
 /* Build header + payload for a specific packet index and send as notification. */
-static void opusSendPacketAtIndex(uint16_t pktIdx, uint8_t extraFlags)
+/* Returns TRUE if the packet was handed to the stack, FALSE if the ATT buffer
+ * pool was exhausted. A FALSE return is normal backpressure, not an error:
+ * the caller must retry the SAME packet rather than advancing.
+ *
+ * This exists because AttsHandleValueNtf() returns void and silently discards
+ * notifications when the pool is full. That was losing ~75 of 200 packets on
+ * every first-pass window send. */
+static bool_t opusSendPacketAtIndex(uint16_t pktIdx, uint8_t extraFlags)
 {
   const uint8_t *pData;
   uint32_t totalLen;
@@ -186,13 +216,13 @@ static void opusSendPacketAtIndex(uint16_t pktIdx, uint8_t extraFlags)
   pData = MicTaskGetOpusData(&totalLen);
   if (totalLen == 0U || pktIdx >= g_totalPackets)
   {
-    return;
+    return TRUE;
   }
 
   uint32_t offset = (uint32_t)pktIdx * g_payloadBytes;
   if (offset >= totalLen)
   {
-    return;
+    return TRUE;
   }
 
   uint32_t remaining = totalLen - offset;
@@ -224,7 +254,19 @@ static void opusSendPacketAtIndex(uint16_t pktIdx, uint8_t extraFlags)
 
   opusValLen = (uint16_t)(OPUS_META_BYTES + chunkLen);
   AttsSetAttr(OPUS_VAL_HDL, opusValLen, opusValBuf);
-  AttsHandleValueNtf(g_connId, OPUS_VAL_HDL, opusValLen, opusValBuf);
+
+  /* Allocate from the ATT pool first. NULL means the stack has no room, so
+   * skip this send and let the caller retry. */
+  uint8_t *pNtfBuf = (uint8_t *)AttMsgAlloc(opusValLen, ATT_PDU_VALUE_NTF);
+  if (pNtfBuf == NULL)
+  {
+    g_txBackpressure++;
+    return FALSE;
+  }
+
+  memcpy(pNtfBuf, opusValBuf, opusValLen);
+  AttsHandleValueNtfZeroCpy(g_connId, OPUS_VAL_HDL, opusValLen, pNtfBuf);
+  return TRUE;
 }
 
 /* ======================================================================
@@ -412,6 +454,7 @@ bool_t OpusStreamOnJsonCmd(const char *json, uint16_t len)
     g_windowSize  = (uint16_t)win;
     g_windowStart = 0;
     g_windowSent  = 0;
+	g_txBackpressure = 0;
     g_streamState = STREAM_SENDING_WINDOW;
 
     am_util_debug_printf("OpusStream: start (window=%u, packets=%u, bytes=%u)\r\n",
@@ -518,16 +561,22 @@ void OpusStreamTick(void)
                        || (pktIdx == (uint16_t)(g_totalPackets - 1U));
 
     uint8_t extraFlags = lastInWindow ? OPUS_FLAG_WINDOW_END : 0;
-    opusSendPacketAtIndex(pktIdx, extraFlags);
+    if (!opusSendPacketAtIndex(pktIdx, extraFlags))
+    {
+      /* Pool full — retry this same packet shortly. */
+      opusSchedule(OPUS_RETRY_DELAY_MS);
+      return;
+    }
     g_windowSent++;
 
     if (lastInWindow)
     {
       g_streamState = STREAM_WAITING_ACK;
       opusSchedule(OPUS_ACK_TIMEOUT_MS);
-      am_util_debug_printf("OpusStream: window sent (pkts %u-%u / %u)\r\n",
+      am_util_debug_printf("OpusStream: window sent (pkts %u-%u / %u, backpressure=%u)\r\n",
                            (unsigned)g_windowStart, (unsigned)pktIdx,
-                           (unsigned)g_totalPackets);
+                           (unsigned)g_totalPackets,
+                           (unsigned)g_txBackpressure);
     }
     else
     {
@@ -550,7 +599,12 @@ void OpusStreamTick(void)
     bool_t   lastResend = (g_missingIdx == (uint16_t)(g_missingCount - 1U));
     uint8_t  extraFlags = lastResend ? OPUS_FLAG_WINDOW_END : 0;
 
-    opusSendPacketAtIndex(pktIdx, extraFlags);
+    if (!opusSendPacketAtIndex(pktIdx, extraFlags))
+    {
+      /* Pool full — retry this same packet shortly. */
+      opusSchedule(OPUS_RETRY_DELAY_MS);
+      return;
+    }
     g_missingIdx++;
 
     if (lastResend)

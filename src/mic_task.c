@@ -4,21 +4,30 @@
 //!
 //! @brief Mic record/playback: AUDADC analog mic input, I2S0 TX speaker output.
 //!
-//! Press BUTTON1 (SW2)   -> record REC_SECONDS of audio from CMM-2718AB MEMS mic.
+//! Press BUTTON1 (SW2)   -> record REC_SECONDS of audio from the MEMS mic.
 //! Press again           -> play back through MAX98357A speaker via I2S0 TX.
 //! Long press (2 s)      -> play 1 kHz test tone.
 //!
-//! After recording, audio is resampled 23438 Hz -> 16 kHz mono int16 in
-//! g_pcmBuf and encoded to Opus 32 kbit/s CBR in g_opusBuf for the BLE
-//! stream service.
+//! Capture chain, in order:
+//!   AUDADC (12-bit, 4 slots) -> DC blocker -> 4 kHz LPF -> decimate to 16 kHz
+//!   -> noise gate -> g_pcmBuf -> Opus encode -> g_opusBuf (for BLE transfer)
+//!
+//! The KWS feed taps off BEFORE the noise gate, so quiet sounds reach the
+//! wake-word model unattenuated.
 //!
 //! Wiring (Apollo4p Blue KXR EVB):
-//!   CMM-2718AB OUT -> 100 nF series cap -> AUDADC SE0 (PGA channel A)
-//!   CMM-2718AB VDD <- VDDAUDA / AUDA (~1.7 V), 100 nF to GND
-//!   MAX98357 BCLK  -> GPIO 11 (I2S0_CLK)
-//!   MAX98357 LRC   -> GPIO 13 (I2S0_WS)
-//!   MAX98357 DIN   -> GPIO 12 (I2S0_SDOUT)
-//!   MAX98357 SD    -> 3.3 V (enable)
+//!   MEMS mic OUT   -> 1 uF series cap -> J17 "D0N" (= AUDADC SE0)
+//!   MEMS mic VDD   <- J17 "AUDA" (VDDAUDA, measured 1.79 V)
+//!                     with 0.1 uF + 10 uF decoupling at the mic (not implemented right now)
+//!   MEMS mic GND   -> J17 GND
+//!   MAX98357 BCLK  -> GPIO 11 (I2S0_CLK),   on header J11
+//!   MAX98357 LRC   -> GPIO 13 (I2S0_WS),    on header J9
+//!   MAX98357 DIN   -> GPIO 12 (I2S0_SDOUT), on header J9
+//!   MAX98357 SD    -> GPIO 8  (firmware-controlled shutdown, see AMP_SD_PIN)
+//!   MAX98357 VIN   -> 3.3 V (separate rail from the mic supply)
+//!   Speaker +/-    -> MAX98357 output ONLY. The "-" terminal is a driven
+//!                     output on this bridge-tied-load amp, NOT ground.
+//!                     Tying anything else to it floats the mic's reference.
 //!
 //! Sample rates:
 //!   AUDADC capture: HFRC 48 MHz / div32 / 64 = 23,437.5 Hz
@@ -51,21 +60,27 @@
 
 #define MIC_I2S_MODULE      0
 
-// I2S0 TX GPIO pins (speaker only — no SDIN: capture is on AUDADC)
+// I2S0 TX GPIO pins (speaker only -- no SDIN: capture is on AUDADC)
 #define MIC_CLK_PIN         11
 #define MIC_CLK_FUNC        AM_HAL_PIN_11_I2S0_CLK
 #define MIC_WS_PIN          13
 #define MIC_WS_FUNC         AM_HAL_PIN_13_I2S0_WS
 #define MIC_SDOUT_PIN       12
 #define MIC_SDOUT_FUNC      AM_HAL_PIN_12_I2S0_SDOUT
-#define AMP_SD_PIN          8      // MAX98357A SD (shutdown) — low=off, high=on
+
+// MAX98357A shutdown control. Driven LOW during listen/record so the amp's
+// Class-D switching cannot couple into the mic; HIGH during playback/tone.
+// Measured: 0 V when low, 1.79 V when high -- the Adafruit breakout's SD/GAIN
+// resistor network forms a divider, so it does not reach a full 3.3 V. 1.79 V
+// is comfortably above the amp's enable threshold, so this is fine.
+#define AMP_SD_PIN          8
 
 // I2S TX DMA: 256 words = 128 stereo frames per ISR completion (~5.46 ms).
 #define MIC_DMA_SAMPLES     256
 
 // AUDADC DMA words per completion. SAMPMODE_MED + 4 slots emits 2 DMA words
 // per scan (A-pair + B-pair). 256 words = 128 scans = 128 channel-A samples
-// per completion (~5.46 ms — one ISR call every ~5.46 ms, so ~183/sec).
+// per completion (~5.46 ms -- one ISR call every ~5.46 ms, so ~183/sec).
 #define AUDADC_DMA_WORDS    256
 #define AUDADC_MONO_SAMPLES 128
 
@@ -76,13 +91,42 @@
 #define MIC_SRC_B1          3
 #define MIC_RECORD_SOURCE   MIC_SRC_A0   // SE0 = analog mic
 
-// AUDADC gain (dB). PREAMP_GAIN is per-channel preamp; CHANNEL_GAIN is the
-// internal PGA stage. Tuned for CMM-2718AB at conversational distance.
-#define PREAMP_GAIN_DB      18  //originally was 12.Changing to 18 hd no effect. Looks like it is getting clobbered. 
-#define CHANNEL_GAIN_DB     24   // orignally was 6, 24 works well
+//*****************************************************************************
+// AUDADC gain -- READ THIS BEFORE CHANGING
+//
+// There are two gain APIs and only ONE of them takes effect:
+//
+//   am_hal_audadc_gain_set()            <- writes the GAIN register
+//   am_hal_audadc_internal_pga_config() <- OVERWRITES the whole GAIN register
+//
+// mic_audadc_init() calls gain_set() first and internal_pga_config() second,
+// and the HAL's internal_pga_config() does a blind _VAL2FLD write with no
+// read-modify-write. So gain_set() -- and therefore PREAMP_GAIN_DB -- has no
+// effect whatsoever. Verified on hardware: changing PREAMP_GAIN_DB from 12 to
+// 18 produced zero change in measured signal level.
+//
+// CHANNEL_GAIN_DB is the control that actually works. Verified sweep at 1 kHz
+// (fixed tone source, quiet room; values are the ISR's per-second "avg"):
+//
+//   CHANNEL_GAIN_DB   signal   noise   SNR
+//         6             450      52    18.7 dB
+//        12             753      54    22.9 dB
+//        18            1677      58    29.2 dB
+//        24            3154      69    33.2 dB   <- current setting
+//        30            6243     102    35.7 dB
+//
+// 24 was chosen over 30: the extra 2.5 dB of SNR was not worth 6 dB of
+// clipping headroom, and quiet-room peaks became erratic at 30.
+//
+// PREAMP_GAIN_DB remains only because the gain_set() calls have not been
+// removed. It is dead. Do not tune it.
+//*****************************************************************************
+#define PREAMP_GAIN_DB      18   // INERT -- see note above
+#define CHANNEL_GAIN_DB     24   // the operative gain control
 
-// CMM-2718AB requires 1.6-3.6 V. Apollo MICBIAS trim values below bypass mode
-// only reach ~0.9-1.5 V; trim 63 selects bypass mode (VDDAUDA, ~1.7 V).
+// MICBIAS trim. The mic is externally powered from J17 "AUDA" (1.79 V), not
+// from MICBIAS -- but the AUDADC still needs its bias enabled or it produces
+// no output at all.
 #define MIC_BIAS_TRIM       63
 
 // BUTTON1 (SW2) = GPIO 19. BUTTON0 (SW1, GPIO 17) is reserved for BLE messages.
@@ -98,9 +142,9 @@
 // Native AUDADC / I2S sample rate
 #define MIC_NATIVE_RATE     23438
 
-// PCM storage rate — Opus encoder requires 16 kHz mono int16 input.
+// PCM storage rate -- Opus encoder requires 16 kHz mono int16 input.
 #define REC_PCM_RATE        16000
-#define REC_SECONDS         10
+#define REC_SECONDS         30
 #define REC_PCM_SAMPLES     (REC_PCM_RATE * REC_SECONDS)
 
 // Opus encoder framing (fixed by SDK library: 20 ms @ 16 kHz, CBR 32 kbit/s)
@@ -110,12 +154,12 @@
 #define OPUS_BUF_BYTES      (OPUS_NUM_FRAMES * OPUS_FRAME_BYTES)
 
 // Resampler steps in 16.16 Q-format.
-//   Capture:  out=16000 from in=23438 -> step = 23438/16000 ≈ 1.4649
-//   Playback: out=23438 from in=16000 -> step = 16000/23438 ≈ 0.6826
+//   Capture:  out=16000 from in=23438 -> step = 23438/16000 ~ 1.4649
+//   Playback: out=23438 from in=16000 -> step = 16000/23438 ~ 0.6826
 #define CAP_STEP_Q16  (uint32_t)(((uint64_t)MIC_NATIVE_RATE << 16) / REC_PCM_RATE)
 #define PLAY_STEP_Q16 (uint32_t)(((uint64_t)REC_PCM_RATE   << 16) / MIC_NATIVE_RATE)
 
-// Per-second stats: 23438 Hz / 128 mono samples per ISR ≈ 183 ISR calls/sec.
+// Per-second stats: 23438 Hz / 128 mono samples per ISR ~ 183 ISR calls/sec.
 #define SEC_CHUNKS          183
 
 #ifndef KWS_DISABLE
@@ -125,13 +169,13 @@
 #define KWS_MFCC_FRAME_POW2 512
 
 // neuralSPOT ns_mfcc_map_arena / ns_fbanks_map_arena multiply pointer-arithmetic
-// offsets by sizeof(T) on a T* pointer, inflating the layout by 4×. The
+// offsets by sizeof(T) on a T* pointer, inflating the layout by 4x. The
 // buffers don't overlap as long as the arena is large enough; 64 KB is plenty.
 #define MFCC_ARENA_BYTES    (64 * 1024)
 #endif
 
 //*****************************************************************************
-// DMA buffers — shared SRAM, 16-byte aligned
+// DMA buffers -- shared SRAM, 16-byte aligned
 //*****************************************************************************
 
 #ifndef KWS_DISABLE
@@ -146,13 +190,13 @@ static float                 g_mfccFeatures[KWS_NUM_FRAMES * KWS_NUM_COEFFS];
 static uint32_t              g_mfccFrameCount = 0;
 static ns_mfcc_cfg_t         g_mfccCfg;
 
-// Software gain applied only on the KWS feed — brings the AUDADC PCM into the
+// Software gain applied only on the KWS feed -- brings the AUDADC PCM into the
 // range Google Speech Commands was trained on without touching the recording
-// path. 4x ≈ +12 dB; saturates to int16 full scale.
+// path. Saturates to int16 full scale.
 #define KWS_SW_GAIN          2
 
 // Energy gate: peak |sample| over the 1-second KWS window must exceed this to
-// invoke the model. Below it, force-classify as silence — eliminates the
+// invoke the model. Below it, force-classify as silence -- eliminates the
 // "go"/"yes" hallucinations the DS-CNN model emits on AUDADC residual noise.
 #define KWS_PEAK_GATE        2000
 static volatile int32_t      g_kwsWindowPeak = 0;
@@ -167,13 +211,12 @@ AM_SHARED_RW static uint32_t g_txBufRawB[2 * MIC_DMA_SAMPLES + 3];
 
 //*****************************************************************************
 // Recording buffers (in shared SRAM)
-//   g_pcmBuf  — 16 kHz int16 mono PCM, used for on-device playback
-//   g_opusBuf — Opus 32 kbit/s CBR, ready for BLE transmission
+//   g_pcmBuf  -- 16 kHz int16 mono PCM, used for on-device playback
+//   g_opusBuf -- Opus 32 kbit/s CBR, ready for BLE transmission
 //*****************************************************************************
 
 AM_SHARED_RW static int16_t g_pcmBuf[REC_PCM_SAMPLES];
 AM_SHARED_RW static uint8_t g_opusBuf[OPUS_BUF_BYTES];
-
 
 static volatile uint32_t g_opusLen = 0;
 
@@ -199,7 +242,9 @@ static volatile uint32_t   g_recLen   = 0;
 static volatile bool       g_recDone  = false;
 static volatile bool       g_playDone = false;
 
-// Test tone: 1 kHz square wave, 2 seconds at native rate.
+// Test tone: 1 kHz square wave, 2 seconds at native rate. Generated directly
+// in the I2S ISR, so it bypasses g_pcmBuf and the playback resampler entirely
+// -- useful for checking the amp/speaker path in isolation.
 #define TONE_FREQ           1000
 #define TONE_HALF_PERIOD    (MIC_NATIVE_RATE / (TONE_FREQ * 2))
 #define TONE_AMPLITUDE      0x200000
@@ -211,19 +256,23 @@ static volatile bool       g_toneDone = false;
 static volatile int32_t   g_capLast       = 0;
 static volatile uint32_t  g_capAccum      = 0;
 
-// DC blocker (single-pole IIR HPF). The CMM-2718AB has a measurable DC bias
-// at the AUDADC pin; leaving it in skews FFT bin 0 and any subsequent feature.
+// DC blocker (single-pole IIR HPF). The mic has a measurable DC bias at the
+// AUDADC pin; leaving it in skews FFT bin 0 and any subsequent feature.
 //   y[n] = x[n] - x[n-1] + R * y[n-1]
-// R = 32440/32768 ≈ 0.9900 → corner ≈ 37 Hz at 23.4 kHz (well below speech).
+// R = 32440/32768 ~ 0.9900 -> corner ~ 37 Hz at 23.4 kHz (well below speech).
 #define DC_BLOCK_R_Q15  32440
 static volatile int32_t   g_dcPrevIn      = 0;
 static volatile int32_t   g_dcPrevOut     = 0;
 
-// HYER INSERT HERE
 // Anti-alias / de-hiss biquad LPF (Butterworth 2nd order, fc~4 kHz @ 23.438 kHz,
 // Q=0.707). Content above 8 kHz folds back into the audio band as hiss through
 // the 23.438->16 kHz decimator. 4 kHz cutoff preserves speech (0.3-3.4 kHz).
 //   y[n] = b0(x[n] + x[n-2]) + b1*x[n-1] + a1_n*y[n-1] + a2_n*y[n-2]
+//
+// NOTE for model work: this runs ahead of BOTH the recording path and the KWS
+// feed, so anything above 4 kHz is gone before any model sees it. If a model
+// was trained on wider-band audio (e.g. chewing, which has high-frequency
+// content), that is a train/inference mismatch worth checking.
 #define LPF_B0     0.1615f
 #define LPF_B1     0.3231f
 #define LPF_A1_N   0.5871f
@@ -233,41 +282,55 @@ static volatile float     g_lpfX2         = 0.0f;
 static volatile float     g_lpfY1         = 0.0f;
 static volatile float     g_lpfY2         = 0.0f;
 
-// Downward expander (soft noise gate). Below the threshold the gain is squared,
-// so noise-floor samples get heavy attenuation while speech passes unchanged.
-// Asymmetric envelope (fast attack, slow release) avoids pumping on transients.
+//*****************************************************************************
+// Downward expander (soft noise gate) -- applied ONLY to the recording path.
+//
 //   gain(env) = 1                   if env >= GATE_THRESH
-//   gain(env) = (env/GATE_THRESH)^2 if env <  GATE_THRESH  (clipped to GATE_FLOOR)
-// Raise GATE_THRESH if hiss is still audible in pauses; lower it if soft word
-// onsets get chopped.
-#define GATE_THRESH        3500.0f  // 2000.0f worked OK
-#define GATE_FLOOR         0.03f  // was 0.03f
-#define GATE_ATTACK_A      0.005f     // ~9 ms attack  //was 0.20f
-#define GATE_RELEASE_A     0.0004f    // ~55 ms release  // was 0.0015f
+//   gain(env) = (env/GATE_THRESH)^2 if env <  GATE_THRESH  (clamped to FLOOR)
+//
+// Tuning history, all judged on BLE-transferred audio played on a phone (which
+// bypasses the local playback path):
+//
+//   GATE_ATTACK_A  0.20 -> 0.005    0.20 tracked individual pitch cycles and
+//                                   modulated the waveform; 0.005 (~9 ms)
+//                                   tracks syllables instead.
+//   GATE_RELEASE_A 0.0015 -> 0.0004 Fixed audible pops. With release only 3x
+//                                   slower than attack the gain snapped across
+//                                   the threshold; 0.0004 glides through it.
+//                                   DO NOT speed this back up.
+//   GATE_THRESH    600 -> 3500      Raised until hiss in pauses was gone. No
+//                                   word-onset clipping observed even at 3500.
+//
+// IMPORTANT: at GATE_THRESH 3500 the threshold sits ABOVE typical speech RMS
+// (~1000 at CHANNEL_GAIN_DB 24) -- it works because the envelope peaks much
+// higher than RMS. This is aggressive processing tuned for a human listener.
+// Anything quieter than speech is heavily attenuated, so a model that needs to
+// detect quiet events should tap the signal BEFORE this gate, as KWS does.
+//*****************************************************************************
+#define GATE_THRESH        3500.0f
+#define GATE_FLOOR         0.03f
+#define GATE_ATTACK_A      0.005f     // ~9 ms attack
+#define GATE_RELEASE_A     0.0004f    // slow release -- pop suppression
 static volatile float     g_gateEnv       = 0.0f;
 
 // Playback-side resampler state (16000 Hz int16 -> 23438 Hz int24)
 static volatile uint32_t  g_playPhaseQ16  = 0;
 static volatile uint32_t  g_playSrcIdx    = 0;
 
-// One-shot playback capture for debugging the reconstruction path.
-static volatile uint32_t g_dbgPlayCapture = 0;   // 1 = arm, ISR sets 2 when full
-#define DBG_PLAY_N  48
-AM_SHARED_RW static int32_t  g_dbgPlayOut[DBG_PLAY_N];   // interpolated output
-AM_SHARED_RW static int16_t  g_dbgPlaySrc[DBG_PLAY_N];   // g_pcmBuf[g_playSrcIdx]
-AM_SHARED_RW static uint16_t g_dbgPlayPhase[DBG_PLAY_N]; // phase at that step
-static volatile uint32_t g_dbgPlayPos = 0;
-
-// Playback-side reconstruction LPF. Linear interpolation from 16 kHz to
-// 23.438 kHz leaves corner artifacts and aliasing that sound metallic on
-// speech. Same 4 kHz biquad as capture; separate state so the two don't
-// interfere.
+// Playback-side reconstruction LPF, with separate state from the capture
+// filter so the two ISRs cannot corrupt each other. Added while chasing a
+// buzzy playback artifact that turned out to be a failed speaker, so its
+// benefit is unproven -- a candidate for removal if the float work in the I2S
+// ISR ever matters. The audio is already low-passed at 4 kHz during capture,
+// so this filters a second time and makes playback slightly duller.
 static volatile float     g_plpfX1        = 0.0f;
 static volatile float     g_plpfX2        = 0.0f;
 static volatile float     g_plpfY1        = 0.0f;
 static volatile float     g_plpfY2        = 0.0f;
 
-// Per-second debug stats
+// Per-second debug stats. g_secAvg is computed on the post-LPF, PRE-GATE
+// signal, so it is a true noise-floor measure and is unaffected by gate
+// tuning. Use it, not the gated RMS, when comparing hardware changes.
 static volatile uint32_t g_dmaBufCount  = 0;
 static volatile int32_t  g_secSumAbs    = 0;
 static volatile int32_t  g_secAvg       = 0;
@@ -343,7 +406,7 @@ static am_hal_audadc_gain_config_t g_sAudadcGainConfig =
 
 // AUDADC DMA word layout: 12-bit sample left-justified in bits[15:4] (low slot)
 // and bits[31:20] (high slot). Cast to int16 sign-extends; result is full
-// int16-scaled (~±32K) so no further shift is needed before resampling.
+// int16-scaled (~+/-32K) so no further shift is needed before resampling.
 static inline int32_t extract_audadc_low_sample(uint32_t raw)
 {
     return (int32_t)((int16_t)(raw & 0xFFF0));
@@ -391,7 +454,8 @@ static inline int32_t soft_limit_i2s24(int32_t sample)
 }
 
 //*****************************************************************************
-// ISR — AUDADC0 (capture path: DC-block + resample to 16 kHz int16)
+// ISR -- AUDADC0
+// Capture chain: extract -> DC block -> LPF -> envelope -> decimate -> gate
 //*****************************************************************************
 
 void am_audadc0_isr(void)
@@ -415,16 +479,19 @@ void am_audadc0_isr(void)
     int32_t sumAbs = 0;
     for (uint32_t i = 0; i < AUDADC_DMA_WORDS; i++)
     {
+        // 4 slots are enabled (the Ambiq reference design; DMA does not
+        // complete reliably with fewer). Only the SE0 words are ours.
         if (!audadc_word_matches_src(rxBuf[i], MIC_RECORD_SOURCE)) continue;
 
         int32_t xo_raw = extract_record_sample(rxBuf[i], MIC_RECORD_SOURCE);
 
-        // DC blocker: y[n] = x[n] - x[n-1] + R * y[n-1]
+        // --- DC blocker: y[n] = x[n] - x[n-1] + R * y[n-1] ---
         int32_t xo_dc = xo_raw - g_dcPrevIn +
                         (int32_t)(((int64_t)DC_BLOCK_R_Q15 * g_dcPrevOut) >> 15);
         g_dcPrevIn  = xo_raw;
         g_dcPrevOut = xo_dc;
 
+        // --- 4 kHz biquad LPF ---
         float xf = (float)xo_dc;
         float yf = LPF_B0 * (xf + g_lpfX2)
                  + LPF_B1 * g_lpfX1
@@ -435,20 +502,20 @@ void am_audadc0_isr(void)
         g_lpfY2 = g_lpfY1;
         g_lpfY1 = yf;
         int32_t xo = (int32_t)yf;
-		//int32_t xo = xo_dc;
 
+        // --- Gate envelope follower (asymmetric: fast attack, slow release) ---
         float abs_y = (yf >= 0.0f) ? yf : -yf;
         if (abs_y > g_gateEnv)
             g_gateEnv += GATE_ATTACK_A  * (abs_y - g_gateEnv);
         else
             g_gateEnv += GATE_RELEASE_A * (abs_y - g_gateEnv);
 
+        // Per-second stats are taken here, PRE-gate.
         int32_t ao = (xo < 0 ? -xo : xo);
-		// END dc BLOCKER CODE
         sumAbs += ao;
         if (ao > g_secPeak) g_secPeak = ao;
 
-        // Resample 23438 -> 16000 (active in LISTENING and RECORDING)
+        // --- Decimate 23438 -> 16000 (active in LISTENING and RECORDING) ---
         if (g_mode == MODE_LISTENING || g_mode == MODE_RECORDING)
         {
             g_capAccum += 65536u;
@@ -464,6 +531,7 @@ void am_audadc0_isr(void)
 
                 if (g_mode == MODE_RECORDING && g_recPos < REC_PCM_SAMPLES)
                 {
+                    // --- Noise gate, recording path only ---
                     float gate_gain;
                     if (g_gateEnv >= GATE_THRESH)
                     {
@@ -481,6 +549,8 @@ void am_audadc0_isr(void)
                     g_pcmBuf[g_recPos++] = (int16_t)s16g;
                 }
 #ifndef KWS_DISABLE
+                // KWS feed taps in UNGATED, so quiet speech still reaches the
+                // wake-word model.
                 else if (g_mode == MODE_LISTENING && g_kwsReadyBuf == 0xFF)
                 {
                     int32_t kg = (int32_t)s16 * KWS_SW_GAIN;
@@ -527,7 +597,7 @@ void am_audadc0_isr(void)
 }
 
 //*****************************************************************************
-// ISR — I2S0 (TX-only: playback / test tone / silence)
+// ISR -- I2S0 (TX-only: playback / test tone / silence)
 //*****************************************************************************
 
 void am_dspi2s0_isr(void)
@@ -552,9 +622,14 @@ void am_dspi2s0_isr(void)
             int16_t s0 = g_pcmBuf[g_playSrcIdx];
             int16_t s1 = (g_playSrcIdx + 1 < g_recLen)
                          ? g_pcmBuf[g_playSrcIdx + 1] : s0;
+
+            // Linear interpolation. The int64 cast is REQUIRED: (s1-s0) can
+            // reach +/-65534 and phase reaches 65535, so the product overflows
+            // int32 at high signal levels and corrupts samples.
             int32_t out = (int32_t)s0 +
                           (int32_t)(((int64_t)(s1 - s0) * (int64_t)g_playPhaseQ16) >> 16);
 
+            // Reconstruction LPF (see note at the g_plpfX1 declaration).
             float pxf = (float)out;
             float pyf = LPF_B0 * (pxf + g_plpfX2)
                       + LPF_B1 * g_plpfX1
@@ -565,15 +640,6 @@ void am_dspi2s0_isr(void)
             g_plpfY2 = g_plpfY1;
             g_plpfY1 = pyf;
             out = (int32_t)pyf;
-			
-			if (g_dbgPlayCapture == 1 && g_dbgPlayPos < DBG_PLAY_N)
-            {
-                g_dbgPlayOut[g_dbgPlayPos]   = out;
-                g_dbgPlaySrc[g_dbgPlayPos]   = s0;
-                g_dbgPlayPhase[g_dbgPlayPos] = (uint16_t)g_playPhaseQ16;
-                g_dbgPlayPos++;
-                if (g_dbgPlayPos >= DBG_PLAY_N) g_dbgPlayCapture = 2;
-            }
 
             int32_t s24 = soft_limit_i2s24(out << PLAY_VOL_SHIFT);
             uint32_t tx = pack_i2s24_tx(s24);
@@ -626,20 +692,21 @@ static void mic_i2s_tx_init(uint32_t txPtrA, uint32_t txPtrB)
     outCfg.GP.cfg_b.uFuncSel = MIC_CLK_FUNC;
     am_hal_gpio_pinconfig(MIC_CLK_PIN, outCfg);
 
-	// MAX98357A SD control — plain push-pull GPIO output (function 3 = GPIO on
-    // Apollo4), NOT an I2S alt-function like the pins above. Start LOW = amp off.
-    am_hal_gpio_pincfg_t ampSdCfg = { 0 };
-    ampSdCfg.GP.cfg_b.eGPOutCfg = 1;   // push-pull output
-    ampSdCfg.GP.cfg_b.ePullup   = 0;   // no pullup
-    ampSdCfg.GP.cfg_b.uFuncSel  = AM_HAL_PIN_8_GPIO;   // = 3, GPIO function for pin 8
-    am_hal_gpio_pinconfig(AMP_SD_PIN, ampSdCfg);
-    am_hal_gpio_state_write(AMP_SD_PIN, AM_HAL_GPIO_OUTPUT_CLEAR);
-
     outCfg.GP.cfg_b.uFuncSel = MIC_WS_FUNC;
     am_hal_gpio_pinconfig(MIC_WS_PIN, outCfg);
 
     outCfg.GP.cfg_b.uFuncSel = MIC_SDOUT_FUNC;
     am_hal_gpio_pinconfig(MIC_SDOUT_PIN, outCfg);
+
+    // The SD control pin needs its OWN pin config with the plain GPIO
+    // function. Reusing outCfg here silently gave it an I2S alt-function, so
+    // the pin never drove a real logic level (measured 0.27 V in both states).
+    am_hal_gpio_pincfg_t ampSdCfg = { 0 };
+    ampSdCfg.GP.cfg_b.eGPOutCfg = 1;                  // push-pull output
+    ampSdCfg.GP.cfg_b.ePullup   = 0;                  // no pullup
+    ampSdCfg.GP.cfg_b.uFuncSel  = AM_HAL_PIN_8_GPIO;  // = 3, plain GPIO
+    am_hal_gpio_pinconfig(AMP_SD_PIN, ampSdCfg);
+    am_hal_gpio_state_write(AMP_SD_PIN, AM_HAL_GPIO_OUTPUT_CLEAR);  // amp off
 
     am_hal_i2s_initialize(MIC_I2S_MODULE, &g_pI2SHandle);
     am_hal_i2s_power_control(g_pI2SHandle, AM_HAL_I2S_POWER_ON, false);
@@ -661,18 +728,23 @@ static void mic_i2s_tx_init(uint32_t txPtrA, uint32_t txPtrB)
 
 static void mic_audadc_init(uint32_t dmaPtrA, uint32_t dmaPtrB)
 {
-    // Power up AUDADC analog front-end. mic_bias must be enabled even though
-    // CMM-2718AB has its own integrated bias; it powers internal converter
-    // biasing and without it the AUDADC produces zero output.
+    // Power up AUDADC analog front-end. micbias must be enabled even though the
+    // mic is externally powered; it also powers internal converter biasing and
+    // without it the AUDADC produces zero output.
     am_hal_audadc_refgen_powerup();
     am_hal_audadc_pga_powerup(0);
     am_hal_audadc_pga_powerup(1);
     am_hal_audadc_pga_powerup(2);
     am_hal_audadc_pga_powerup(3);
+
+    // NOTE: these four calls are INERT. am_hal_audadc_internal_pga_config()
+    // below overwrites the GAIN register they write. Kept only to match the
+    // Ambiq reference sequence; see the PREAMP_GAIN_DB note at the top.
     am_hal_audadc_gain_set(0, 2 * PREAMP_GAIN_DB);
     am_hal_audadc_gain_set(1, 2 * PREAMP_GAIN_DB);
     am_hal_audadc_gain_set(2, 2 * PREAMP_GAIN_DB);
     am_hal_audadc_gain_set(3, 2 * PREAMP_GAIN_DB);
+
     am_hal_audadc_micbias_powerup(MIC_BIAS_TRIM);
     am_util_delay_ms(400);   // bias/refgen settle (per Ambiq example)
 
@@ -688,7 +760,7 @@ static void mic_audadc_init(uint32_t dmaPtrA, uint32_t dmaPtrB)
         .eSampMode      = AM_HAL_AUDADC_SAMPMODE_MED,
     };
 
-    // IRTT: HFRC 48 MHz / div32 / (63+1) = 23,437.5 Hz — matches I2S TX rate.
+    // IRTT: HFRC 48 MHz / div32 / (63+1) = 23,437.5 Hz -- matches I2S TX rate.
     am_hal_audadc_irtt_config_t irttCfg =
     {
         .bIrttEnable      = true,
@@ -703,8 +775,9 @@ static void mic_audadc_init(uint32_t dmaPtrA, uint32_t dmaPtrB)
     am_hal_audadc_enable(g_pAUDADCHandle);
     am_hal_audadc_irtt_enable(g_pAUDADCHandle);
 
-    // 4 slots all 12-bit. Audio comes in on SE0 (channel A LG); SE1-SE3 are
-    // configured per the standard Ambiq reference and the ISR ignores them.
+    // All 4 slots enabled, 12-bit. Audio is on SE0 (channel A LG); the ISR
+    // filters the other slots out. Do NOT disable SE1-SE3: DMA then stops
+    // completing entirely and the AUDADC ISR never fires (verified).
     am_hal_audadc_slot_config_t slotCfg =
     {
         .eMeasToAvg     = AM_HAL_AUDADC_SLOT_AVG_1,
@@ -722,6 +795,9 @@ static void mic_audadc_init(uint32_t dmaPtrA, uint32_t dmaPtrB)
     slotCfg.eChannel = AM_HAL_AUDADC_SLOT_CHSEL_SE3;
     am_hal_audadc_configure_slot(g_pAUDADCHandle, 3, &slotCfg);
 
+    // THIS is the gain that takes effect. The ui32LGA field is 7 bits (0-127)
+    // and Ambiq does not document its units, so the dB relationship is
+    // empirical -- see the measured sweep at the top of this file.
     g_sAudadcGainConfig.ui32LGA      = (uint32_t)(CHANNEL_GAIN_DB * 2 + 12);
     g_sAudadcGainConfig.ui32HGADELTA = 0;
     g_sAudadcGainConfig.ui32LGB      = (uint32_t)(CHANNEL_GAIN_DB * 2 + 12);
@@ -740,9 +816,11 @@ static void mic_audadc_init(uint32_t dmaPtrA, uint32_t dmaPtrB)
     NVIC_EnableIRQ(AUDADC0_IRQn);
 }
 
-// Enable the MAX98357A only during playback/tone; keep it shut down (quiet)
-// during listening/recording/idle so its Class-D switching can't couple noise
-// into the mic. Tracks the last state to avoid redundant GPIO writes.
+// Enable the MAX98357A only during playback/tone; keep it shut down during
+// listening/recording/idle so its Class-D switching cannot couple into the
+// mic. Verified: with the amp shut down, recordings match the noise floor
+// measured with the amp physically removed. Called once per task loop pass
+// rather than at each mode transition, so it cannot get out of sync.
 static void amp_update_state(void)
 {
     static int lastOn = -1;
@@ -754,6 +832,7 @@ static void amp_update_state(void)
         lastOn = on;
     }
 }
+
 //*****************************************************************************
 // FreeRTOS task
 //*****************************************************************************
@@ -844,8 +923,8 @@ void MicTask(void *pvParameters)
     while (1)
     {
         vTaskDelayUntil(&xLastWake, 10);
-		
-		amp_update_state();
+
+        amp_update_state();
 
         // ---- Button polling: short press vs long press (2 sec) ----
         uint32_t btnVal;
@@ -865,28 +944,9 @@ void MicTask(void *pvParameters)
             btnHoldCnt++;
             if (btnHoldCnt == 200 && (g_mode == MODE_IDLE || g_mode == MODE_LISTENING))
             {
-                static const int16_t sineLut[16] = {
-                        0,  3033,  5605,  7368,  8000,  7368,  5605,  3033,
-                        0, -3033, -5605, -7368, -8000, -7368, -5605, -3033
-                };
-                for (uint32_t n = 0; n < REC_PCM_SAMPLES; n++)
-                {
-                    uint32_t p300  = (n * 300u  * 16u / REC_PCM_RATE) & 15u;
-                    uint32_t p900  = (n * 900u  * 16u / REC_PCM_RATE) & 15u;
-                    uint32_t p2000 = (n * 2000u * 16u / REC_PCM_RATE) & 15u;
-
-                    int32_t mix = ((int32_t)sineLut[p300]  * 4) / 10
-                                + ((int32_t)sineLut[p900]  * 4) / 10
-                                + ((int32_t)sineLut[p2000] * 2) / 10;
-
-                    if (mix >  32767) mix =  32767;
-                    if (mix < -32768) mix = -32768;
-                    g_pcmBuf[n] = (int16_t)mix;
-                }
-                g_recLen  = REC_PCM_SAMPLES;
-                g_recDone = true;
-                g_mode    = MODE_IDLE;
-                am_util_stdio_printf("[mic] Synth multi-tone loaded into g_pcmBuf. Short press to play.\n");
+                g_tonePos = 0;
+                g_mode    = MODE_TESTTONE;
+                am_util_stdio_printf("[mic] TEST TONE: 1kHz square wave, 2 sec...\n");
                 btnDead = 5;
             }
         }
@@ -899,8 +959,6 @@ void MicTask(void *pvParameters)
                 {
                     g_playSrcIdx   = 0;
                     g_playPhaseQ16 = 0;
-					g_dbgPlayPos     = 0;
-                    g_dbgPlayCapture = 1;
                     g_mode         = MODE_PLAYING;
                     am_util_stdio_printf("[mic] Playing %lu PCM samples (%lu sec)...\n",
                                          (unsigned long)g_recLen,
@@ -972,7 +1030,7 @@ void MicTask(void *pvParameters)
         {
             g_recDone = false;
 
-            // Log raw PCM stats for diagnostics
+            // Peak of the recorded (gated) PCM.
             int32_t peakAbs = 0;
             for (uint32_t k = 0; k < g_recLen; k++)
             {
@@ -981,8 +1039,8 @@ void MicTask(void *pvParameters)
             }
             am_util_stdio_printf("[mic] PCM @16kHz: %lu samples, peak=%ld\n",
                                  (unsigned long)g_recLen, (long)peakAbs);
- 
-			// --- RMS over the ENTIRE recording ---
+
+            // RMS over the whole recording, including start/stop transients.
             {
                 uint64_t sumSquares = 0;
                 for (uint32_t k = 0; k < g_recLen; k++)
@@ -1002,12 +1060,15 @@ void MicTask(void *pvParameters)
                 am_util_stdio_printf("[mic] RMS (full): %lu  over %lu samples\n",
                                      (unsigned long)rms, (unsigned long)g_recLen);
             }
-			
-			// --- RMS with the first and last second trimmed off ---
-            // Skips startup/shutdown transients that skew the noise figure.
+
+            // RMS with the first and last second trimmed -- the transients at
+            // each end skew the figure badly. This is the number to compare
+            // across runs. NOTE: measured AFTER the noise gate, so it reflects
+            // gate tuning, not the raw noise floor. For hardware comparisons
+            // use the pre-gate "avg" from the per-second stats instead.
             {
                 uint32_t trim = REC_PCM_RATE;          // 1 second of samples
-                if (g_recLen > (2 * trim))             // only if long enough
+                if (g_recLen > (2 * trim))
                 {
                     uint32_t startIdx = trim;
                     uint32_t endIdx   = g_recLen - trim;   // exclusive
@@ -1095,22 +1156,9 @@ void MicTask(void *pvParameters)
 #endif
             g_mode           = MIC_MODE_INITIAL;
         }
-		
-        if (g_dbgPlayCapture == 2)
-        {
-            g_dbgPlayCapture = 0;
-            am_util_stdio_printf("[play] idx  src    out    phase\n");
-            for (uint32_t d = 0; d < DBG_PLAY_N; d++)
-            {
-                am_util_stdio_printf("  %2lu  %6d %6ld  %5u\n",
-                                     (unsigned long)d,
-                                     (int)g_dbgPlaySrc[d],
-                                     (long)g_dbgPlayOut[d],
-                                     (unsigned)g_dbgPlayPhase[d]);
-            }
-        }
 
         // ---- AUDADC liveness diagnostic every 3 seconds ----
+        // If audadc_isr_count stops climbing, the AUDADC DMA has stalled.
         diagTicks++;
         if (diagTicks >= 300)
         {
@@ -1123,7 +1171,7 @@ void MicTask(void *pvParameters)
             }
         }
 
-        // ---- Per-second stats ----
+        // ---- Per-second stats (PRE-gate: use these for noise measurements) ----
         if (g_printReady)
         {
             g_printReady = 0;
