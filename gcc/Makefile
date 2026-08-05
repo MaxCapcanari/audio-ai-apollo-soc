@@ -399,6 +399,7 @@ LIBS = ../../../../../../mcu/apollo4p/hal/mcu/gcc/bin/libam_hal.a
 LIBS += ../../../../bsp/gcc/bin/libam_bsp.a
 LIBS += ../../../../../../ambiq_ble/profiles/volecommon/codec/opus/gcc/libopus.a
 ifneq ($(KWS_DISABLE),1)
+LIBS += $(NS_BUILD)/extern/codecs/opus1.4/opus14.a
 LIBS += $(NS_BUILD)/neuralspot/ns-audio/ns-audio.a
 LIBS += ./lib/ns-core-noinit.a
 LIBS += $(NS_BUILD)/neuralspot/ns-harness/ns-harness.a
