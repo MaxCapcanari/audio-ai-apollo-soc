@@ -1135,7 +1135,7 @@ void MicTask(void *pvParameters)
 					am_util_stdio_printf("[mic] opus_encoder_init failed: %d\n", err);
 					return;
 				}
-				opus_encoder_ctl(g_enc, OPUS_SET_BITRATE(32000));
+				opus_encoder_ctl(g_enc, OPUS_SET_BITRATE(24000));  // was 32000
 				opus_encoder_ctl(g_enc, OPUS_SET_VBR(0));
 				opus_encoder_ctl(g_enc, OPUS_SET_VBR_CONSTRAINT(0));
 				opus_encoder_ctl(g_enc, OPUS_SET_COMPLEXITY(0));
@@ -1164,6 +1164,9 @@ void MicTask(void *pvParameters)
                             OPUS_FRAME_SAMPLES,
                             &g_opusBuf[opusBytes]);
 #endif
+                if (f < 10 || n != 60)
+                    am_util_stdio_printf("[mic] frame %lu: n=%d\n",
+                                         (unsigned long)f, n);
                 if (n <= 0 || opusBytes + n > OPUS_BUF_BYTES) break;
                 opusBytes += (uint32_t)n;
             }
