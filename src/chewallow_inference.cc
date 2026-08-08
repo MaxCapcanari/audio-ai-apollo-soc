@@ -14,6 +14,7 @@
 #include "chewallow_model_data.h"
 #include "chewallow_inference.h"
 
+#include <cmath>
 #include "ns_core.h"
 #include "am_util.h"
 #include "FreeRTOS.h"
@@ -28,11 +29,11 @@
 // arbitrary tensors -- still need the generic Mul/Add ops registered.
 #define CHEWALLOW_NUM_OPS 7
 
-// Starting arena guess: float32 activations on a (250,22) input are far
+// Starting arena guess: float32 activations on a (79,24) input are far
 // larger than KWS's int8 (49,10) ones. 256 KB is a deliberate overestimate;
 // AllocateTensors() below reports the real arena_used_bytes() so we can
 // right-size this once we have a measurement instead of guessing twice.
-#define CHEWALLOW_TENSOR_ARENA_SIZE (256 * 1024)
+#define CHEWALLOW_TENSOR_ARENA_SIZE (96 * 1024)
 
 __attribute__((section(".sram_bss"))) alignas(16) static uint8_t s_arena[CHEWALLOW_TENSOR_ARENA_SIZE];
 // back to:
@@ -135,38 +136,49 @@ void chewallow_init(void) {
 }
 
 // Shared implementation for chewallow_run / chewallow_run_dummy_timing.
-// Float32 model end-to-end -- no quantize/dequantize step, unlike KWS.
+// int8 model -- quantize the float MFCC input on the way in, dequantize
+// the softmax output on the way out. Scale/zero-point are read from the
+// tensors at runtime so they cannot drift out of sync with the model.
 static int chewallow_run_impl(const float *mfcc_features, float *p_chewallow_out) {
-	if (!s_interpreter || !s_input || !s_output) {
-			am_util_stdio_printf("[chewallow] run called before successful init\r\n");
-			return -1;
-		}
+    if (!s_interpreter || !s_input || !s_output) {
+        am_util_stdio_printf("[chewallow] run called before successful init\r\n");
+        return -1;
+    }
 
-    const int in_floats  = (int)(s_input->bytes  / sizeof(float));
-    const int out_floats = (int)(s_output->bytes / sizeof(float));
+    const int in_count  = (int)s_input->bytes;   // int8 -> 1 byte per element
+    const int out_count = (int)s_output->bytes;
 
-    // Straight copy -- caller is responsible for matching the notebook's
-    // global z-score normalization before calling this.
-    for (int i = 0; i < in_floats; i++) {
-        s_input->data.f[i] = mfcc_features[i];
+    // Quantize. Caller is responsible for matching the notebook's global
+    // z-score normalization before calling this.
+    const float in_scale = s_input->params.scale;
+    const int   in_zp    = s_input->params.zero_point;
+    for (int i = 0; i < in_count; i++) {
+        int32_t q = (int32_t)lrintf(mfcc_features[i] / in_scale) + in_zp;
+        if (q >  127) q =  127;
+        if (q < -128) q = -128;
+        s_input->data.int8[i] = (int8_t)q;
     }
 
     if (s_interpreter->Invoke() != kTfLiteOk) {
         return -1;
     }
 
+    // Dequantize output and find best class
+    const float out_scale = s_output->params.scale;
+    const int   out_zp    = s_output->params.zero_point;
     int   best_idx = 0;
     float best     = -1e9f;
-    for (int i = 0; i < out_floats; i++) {
-        float score = s_output->data.f[i];
+    for (int i = 0; i < out_count; i++) {
+        float score = ((float)s_output->data.int8[i] - (float)out_zp) * out_scale;
         if (score > best) {
             best     = score;
             best_idx = i;
         }
     }
 
-    if (p_chewallow_out && out_floats > CHEWALLOW_IDX_CHEWALLOW) {
-        *p_chewallow_out = s_output->data.f[CHEWALLOW_IDX_CHEWALLOW];
+    if (p_chewallow_out && out_count > CHEWALLOW_IDX_CHEWALLOW) {
+        *p_chewallow_out =
+            ((float)s_output->data.int8[CHEWALLOW_IDX_CHEWALLOW] - (float)out_zp) * out_scale;
     }
     return best_idx;
 }
