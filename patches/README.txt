@@ -44,3 +44,11 @@ Transfer: 5.4 s (was 7.25 s at 120 KB, was 14.47 s at session start)
 BLE settings: OPUS_INTER_PKT_DELAY_MS 15, payload 234 B, window 1000
 
 Also note the negative results, so you don't retry them: connection priority high made things worse; SILK mode was 4× slower than CELT; complexity 1–3 gave no benefit over 4.
+
+------------------------------
+from 8-7-2026 work
+Chewallow 79×24 float32: 5,944 ms/inference, arena 245,280 bytes
+.shared is AT>MCU_MRAM — anything declared AM_SHARED_RW is stored byte-for-byte in flash. Use MIC_NOLOAD (.sram_bss) for scratch buffers. Cost 1.12 MB of MRAM until fixed.
+.sram_bss is not zero-filled at startup in the current linker script, and nothing here needed it — TFLM arenas and DMA buffers are all written before read.
+CMSIS-NN ships inside libtensorflow-microlite-cm4-gcc-release.a; already linked, nothing to configure.
+KWS: ~366 ms inference, ~75 ms MFCC (from March)
