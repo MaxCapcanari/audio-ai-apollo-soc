@@ -7,12 +7,12 @@
 extern "C" {
 #endif
 
-// Model input: (1, 250, 22, 1) float32 — 250 frames of 22-coefficient MFCC,
-// 10ms/10ms (non-overlapping) windows, covering 2.5s of audio.
-// Per notebook: N_MFCC=23 computed, first coefficient deleted -> 22 cols.
-#define CHEWALLOW_NUM_FRAMES   250
-#define CHEWALLOW_NUM_COEFFS   22
-#define CHEWALLOW_INPUT_SIZE   (CHEWALLOW_NUM_FRAMES * CHEWALLOW_NUM_COEFFS)  // 5500
+// Model input: (1, 79, 24, 1) float32 — 79 frames of 24-coefficient MFCC,
+// nfft=1024, winlen=0.064, winstep=0.032, nfilt=32, experiment=2
+// (zeroth coefficient retained -> 24 cols), covering 2.5s of audio.
+#define CHEWALLOW_NUM_FRAMES   79
+#define CHEWALLOW_NUM_COEFFS   24
+#define CHEWALLOW_INPUT_SIZE   (CHEWALLOW_NUM_FRAMES * CHEWALLOW_NUM_COEFFS)  // 1896
 
 #define CHEWALLOW_NUM_CLASSES  2
 // class_names = ['nothing', 'chewallow'] per notebook

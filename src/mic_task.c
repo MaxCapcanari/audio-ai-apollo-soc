@@ -55,6 +55,8 @@
 #ifndef KWS_DISABLE
 #include "kws_inference.h"  // TFLite KWS wrapper
 #include "ns_audio_mfcc.h"  // MFCC feature extraction
+#include "chewallow_inference.h"
+#include "chewallow_dummy_input.h"
 #endif
 
 //*****************************************************************************
@@ -80,6 +82,11 @@
 
 // I2S TX DMA: 256 words = 128 stereo frames per ISR completion (~5.46 ms).
 #define MIC_DMA_SAMPLES     256
+
+// Place scratch buffers in .sram_bss (NOLOAD) instead of .shared (AT>MCU_MRAM).
+// Same SHARED_SRAM region, so DMA reachability is unchanged -- but no copy is
+// stored in flash. g_pcmBuf alone was costing 960 KB of MRAM as literal zeros.
+#define MIC_NOLOAD __attribute__((section(".sram_bss"))) __attribute__((aligned(16)))
 
 // AUDADC DMA words per completion. SAMPMODE_MED + 4 slots emits 2 DMA words
 // per scan (A-pair + B-pair). 256 words = 128 scans = 128 channel-A samples
@@ -150,10 +157,10 @@
 #define REC_SECONDS         30
 #define REC_PCM_SAMPLES     (REC_PCM_RATE * REC_SECONDS)
 
-// Opus encoder framing (fixed by SDK library: 20 ms @ 16 kHz, CBR 32 kbit/s)
+// Opus encoder framing (fixed by SDK library: 20 ms @ 16 kHz, CBR 24 kbit/s)
 #define USE_OPUS14          1     // 1 = neuralSPOT opus1.4 (fixed-point), 0 = Ambiq ae_api blob
 #define OPUS_FRAME_SAMPLES  320
-#define OPUS_FRAME_BYTES    80
+#define OPUS_FRAME_BYTES    60
 #define OPUS_NUM_FRAMES     (REC_SECONDS * 50)
 #define OPUS_BUF_BYTES      (OPUS_NUM_FRAMES * OPUS_FRAME_BYTES)
 #define OPUS_ENC_MEM_WORDS  6400          // 25600 bytes; encoder needs 24544
@@ -876,6 +883,9 @@ void MicTask(void *pvParameters)
     am_util_stdio_printf("[mic] >kws_init\r\n");
     kws_init();
     am_util_stdio_printf("[mic] <kws_init\r\n");
+	am_util_stdio_printf("[mic] >chewallow_init\r\n");
+    chewallow_init();
+    am_util_stdio_printf("[mic] <chewallow_init\r\n");
 
     g_mfccCfg.api              = &ns_mfcc_V1_0_0;
     g_mfccCfg.arena            = g_mfccArena;
@@ -1188,6 +1198,18 @@ void MicTask(void *pvParameters)
                                  (unsigned long)totalMs,
                                  (unsigned long)totalFrames,
                                  (unsigned long)(totalFrames > 0 ? (encodeMs * 1000UL) / totalFrames : 0));
+			
+#ifndef KWS_DISABLE
+            {
+                float chewProb = 0.0f;
+                TickType_t cw0 = xTaskGetTickCount();
+                int rc = chewallow_run_dummy_timing(g_chewallow_dummy_input, &chewProb);
+                TickType_t cw1 = xTaskGetTickCount();
+                am_util_stdio_printf("[chewallow] rc=%d prob=%d/1000 inference=%lu ms\n",
+                                     rc, (int)(chewProb * 1000.0f),
+                                     (unsigned long)(cw1 - cw0));
+            }
+#endif
 			
             am_util_stdio_printf("[mic] Press short=play (PCM), hold 2s=test tone.\n");
 #ifndef KWS_DISABLE

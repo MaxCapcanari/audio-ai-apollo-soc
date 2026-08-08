@@ -34,6 +34,8 @@
 // right-size this once we have a measurement instead of guessing twice.
 #define CHEWALLOW_TENSOR_ARENA_SIZE (64 * 1024)
 
+//__attribute__((section(".sram_bss"))) alignas(16) static uint8_t s_arena[CHEWALLOW_TENSOR_ARENA_SIZE];
+// back to:
 AM_SHARED_RW alignas(16) static uint8_t s_arena[CHEWALLOW_TENSOR_ARENA_SIZE];
 
 static tflite::MicroMutableOpResolver<CHEWALLOW_NUM_OPS> s_resolver;
@@ -135,7 +137,10 @@ void chewallow_init(void) {
 // Shared implementation for chewallow_run / chewallow_run_dummy_timing.
 // Float32 model end-to-end -- no quantize/dequantize step, unlike KWS.
 static int chewallow_run_impl(const float *mfcc_features, float *p_chewallow_out) {
-    if (!s_interpreter) return -1;
+	if (!s_interpreter || !s_input || !s_output) {
+			am_util_stdio_printf("[chewallow] run called before successful init\r\n");
+			return -1;
+		}
 
     const int in_floats  = (int)(s_input->bytes  / sizeof(float));
     const int out_floats = (int)(s_output->bytes / sizeof(float));
