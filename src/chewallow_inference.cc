@@ -32,7 +32,7 @@
 // larger than KWS's int8 (49,10) ones. 256 KB is a deliberate overestimate;
 // AllocateTensors() below reports the real arena_used_bytes() so we can
 // right-size this once we have a measurement instead of guessing twice.
-#define CHEWALLOW_TENSOR_ARENA_SIZE (512 * 1024)
+#define CHEWALLOW_TENSOR_ARENA_SIZE (256 * 1024)
 
 __attribute__((section(".sram_bss"))) alignas(16) static uint8_t s_arena[CHEWALLOW_TENSOR_ARENA_SIZE];
 // back to:

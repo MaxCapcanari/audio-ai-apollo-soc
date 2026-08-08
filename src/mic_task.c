@@ -193,12 +193,12 @@ static uint32_t g_encMem[OPUS_ENC_MEM_WORDS];
 
 #ifndef KWS_DISABLE
 // KWS ping-pong (ISR fills one while task reads the other)
-AM_SHARED_RW static int16_t  g_kwsBuf[2][KWS_FRAME_SAMPLES];
+MIC_NOLOAD static int16_t  g_kwsBuf[2][KWS_FRAME_SAMPLES];
 static volatile uint32_t     g_kwsWriteBuf = 0;
 static volatile uint32_t     g_kwsWritePos = 0;
 static volatile uint32_t     g_kwsReadyBuf = 0xFF;
 
-AM_SHARED_RW static uint8_t  g_mfccArena[MFCC_ARENA_BYTES];
+MIC_NOLOAD static uint8_t  g_mfccArena[MFCC_ARENA_BYTES];
 static float                 g_mfccFeatures[KWS_NUM_FRAMES * KWS_NUM_COEFFS];
 static uint32_t              g_mfccFrameCount = 0;
 static ns_mfcc_cfg_t         g_mfccCfg;
@@ -216,11 +216,11 @@ static volatile int32_t      g_kwsWindowPeak = 0;
 #endif
 
 // AUDADC ping+pong contiguous buffer (HAL alternates halves automatically).
-AM_SHARED_RW static uint32_t g_audadcBufRaw[2 * AUDADC_DMA_WORDS + 3];
+MIC_NOLOAD static uint32_t g_audadcBufRaw[2 * AUDADC_DMA_WORDS + 3];
 
 // I2S TX ping/pong
-AM_SHARED_RW static uint32_t g_txBufRawA[2 * MIC_DMA_SAMPLES + 3];
-AM_SHARED_RW static uint32_t g_txBufRawB[2 * MIC_DMA_SAMPLES + 3];
+MIC_NOLOAD static uint32_t g_txBufRawA[2 * MIC_DMA_SAMPLES + 3];
+MIC_NOLOAD static uint32_t g_txBufRawB[2 * MIC_DMA_SAMPLES + 3];
 
 //*****************************************************************************
 // Recording buffers (in shared SRAM)
@@ -228,8 +228,8 @@ AM_SHARED_RW static uint32_t g_txBufRawB[2 * MIC_DMA_SAMPLES + 3];
 //   g_opusBuf -- Opus 32 kbit/s CBR, ready for BLE transmission
 //*****************************************************************************
 
-AM_SHARED_RW static int16_t g_pcmBuf[REC_PCM_SAMPLES];
-AM_SHARED_RW static uint8_t g_opusBuf[OPUS_BUF_BYTES];
+MIC_NOLOAD static int16_t g_pcmBuf[REC_PCM_SAMPLES];
+MIC_NOLOAD static uint8_t g_opusBuf[OPUS_BUF_BYTES];
 
 static volatile uint32_t g_opusLen = 0;
 
