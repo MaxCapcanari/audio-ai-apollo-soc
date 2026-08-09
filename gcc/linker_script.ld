@@ -78,6 +78,8 @@ SECTIONS
     {
         . = ALIGN(4);
         _sbss = .;
+        /* Exclude FreeRTOS heap (200 KB) from TCM -- routed to .sram_bss
+           below so MCU_TCM has room for the chewallow tensor arena. */
         *(.bss)
         *(.bss*)
         *(COMMON)
@@ -93,12 +95,21 @@ SECTIONS
         . = ALIGN(4);
     } > SHARED_SRAM AT>MCU_MRAM
 
-    .sram_bss (NOLOAD):
-    {
-        . = ALIGN(4);
-        *(.sram_bss)
-        . = ALIGN(4);
-    } > SHARED_SRAM
+	.sram_bss (NOLOAD):
+		{
+			. = ALIGN(4);
+			_ssram_bss = .;
+			*(.sram_bss)
+			. = ALIGN(4);
+			_esram_bss = .;
+		} > SHARED_SRAM
 
+	.tcm_bss (NOLOAD):
+		{
+			. = ALIGN(16);
+			*(.tcm_bss)
+			. = ALIGN(4);
+		} > MCU_TCM
+	
     .ARM.attributes 0 : { *(.ARM.attributes) }
 }
