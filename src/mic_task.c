@@ -882,6 +882,10 @@ void MicTask(void *pvParameters)
 
     am_util_stdio_printf("[mic] >kws_init\r\n");
     kws_init();
+	am_util_stdio_printf("[mic] heap: free=%u  min-ever-free=%u  of %u\r\n",
+                     (unsigned)xPortGetFreeHeapSize(),
+                     (unsigned)xPortGetMinimumEverFreeHeapSize(),
+                     (unsigned)configTOTAL_HEAP_SIZE);
     am_util_stdio_printf("[mic] <kws_init\r\n");
 	am_util_stdio_printf("[mic] >chewallow_init\r\n");
     chewallow_init();
@@ -1253,6 +1257,10 @@ void MicTask(void *pvParameters)
                 am_util_stdio_printf("[mic] audadc_isr_count=%lu recPos=%lu\n",
                                      (unsigned long)g_audadcIsrCount,
                                      (unsigned long)g_recPos);
+                am_util_stdio_printf("[mic] heap: free=%u min-ever-free=%u of %u\r\n",
+                                     (unsigned)xPortGetFreeHeapSize(),
+                                     (unsigned)xPortGetMinimumEverFreeHeapSize(),
+                                     (unsigned)configTOTAL_HEAP_SIZE);
             }
         }
 
