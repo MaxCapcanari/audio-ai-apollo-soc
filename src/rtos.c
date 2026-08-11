@@ -24,6 +24,11 @@
 #include "ble_freertos_fit.h"
 #include "mic_task.h"
 
+#ifndef KWS_DISABLE
+#include "chewallow_inference.h"
+#include "chewallow_dummy_input.h"
+#endif
+
 extern TaskHandle_t radio_task_handle;
 
 extern void HelloJsonOnButton0Pressed(void);
@@ -54,9 +59,20 @@ ButtonTask(void *pvParameters)
             if (!cur)
             {
                 if (lowCount < 4) lowCount++;
-                if (lowCount >= 4)
+				if (lowCount >= 4)
                 {
                     HelloJsonOnButton0Pressed();
+#ifndef KWS_DISABLE
+                    {
+                        float chewProb = 0.0f;
+                        TickType_t c0 = xTaskGetTickCount();
+                        int rc = chewallow_run_dummy_timing(g_chewallow_dummy_input, &chewProb);
+                        TickType_t c1 = xTaskGetTickCount();
+                        am_util_stdio_printf("[timing] chewallow rc=%d inference=%lu ms hwm=%u words\n",
+                                             rc, (unsigned long)(c1 - c0),
+                                             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+                    }
+#endif
                     armed = false;
                     lowCount = 0;
                 }
@@ -154,11 +170,11 @@ setup_task(void *pvParameters)
 
     xTaskCreate(RadioTask, "RadioTask", 1024, 0, 3, &radio_task_handle);
 
-    xTaskCreate(ButtonTask, "ButtonTask", 256, 0, 2, NULL);
+    xTaskCreate(ButtonTask, "ButtonTask", 4096, 0, 4, NULL);
 
     // 16384 words (64 KB) — Opus encoder uses ~10-20 KB; TFLM AllocateTensors
     // can also be stack-heavy during graph planning.
-    xTaskCreate(MicTask, "MicTask", 16384, 0, 2, NULL);
+    xTaskCreate(MicTask, "MicTask", 16384, 0, 4, NULL);
 
     vTaskSuspend(NULL);
 

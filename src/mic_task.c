@@ -211,7 +211,7 @@ static ns_mfcc_cfg_t         g_mfccCfg;
 // Energy gate: peak |sample| over the 1-second KWS window must exceed this to
 // invoke the model. Below it, force-classify as silence -- eliminates the
 // "go"/"yes" hallucinations the DS-CNN model emits on AUDADC residual noise.
-#define KWS_PEAK_GATE        2000
+#define KWS_PEAK_GATE        2000   //2000
 static volatile int32_t      g_kwsWindowPeak = 0;
 #endif
 
@@ -999,13 +999,18 @@ void MicTask(void *pvParameters)
 
 #ifndef KWS_DISABLE
         // ---- KWS: process one 20 ms frame when the ISR hands one over ----
-        uint32_t readyBuf = g_kwsReadyBuf;
+uint32_t readyBuf = g_kwsReadyBuf;
         if (readyBuf != 0xFF && g_mode == MODE_LISTENING)
         {
             float confidence = 0.0f;
+            static uint32_t mfccMs = 0;
+            if (g_mfccFrameCount == 0) { mfccMs = 0; }
+
+            TickType_t m0 = xTaskGetTickCount();
             ns_mfcc_compute(&g_mfccCfg,
                             (const int16_t *)g_kwsBuf[readyBuf],
                             &g_mfccFeatures[g_mfccFrameCount * KWS_MFCC_COEFFS]);
+            mfccMs += (uint32_t)(xTaskGetTickCount() - m0);
             g_mfccFrameCount++;
             g_kwsReadyBuf = 0xFF;
 
@@ -1020,9 +1025,15 @@ void MicTask(void *pvParameters)
                 {
                     int top2_idx = -1;
                     float top2_conf = 0.0f;
+					TickType_t k0 = xTaskGetTickCount();
                     keyword = kws_run_top2(g_mfccFeatures,
                                            &keyword, &confidence,
                                            &top2_idx, &top2_conf);
+                    TickType_t k1 = xTaskGetTickCount();
+                    am_util_stdio_printf("[kws] mfcc(%d frames)=%lu ms  inference=%lu ms\n",
+                                         KWS_NUM_FRAMES,
+                                         (unsigned long)mfccMs,
+                                         (unsigned long)(k1 - k0));
                     if (keyword >= 0 && keyword != KWS_SILENCE_IDX && keyword != KWS_UNKNOWN_IDX)
                     {
                         am_util_stdio_printf("[kws] \"%s\" %.0f%% (2nd=\"%s\" %.0f%%, peak=%ld)\n",
