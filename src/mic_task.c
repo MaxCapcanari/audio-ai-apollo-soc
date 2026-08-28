@@ -12,8 +12,14 @@
 //!   AUDADC (12-bit, 4 slots) -> DC blocker -> 4 kHz LPF -> decimate to 16 kHz
 //!   -> noise gate -> g_pcmBuf -> Opus encode -> g_opusBuf (for BLE transfer)
 //!
-//! The KWS feed taps off BEFORE the noise gate, so quiet sounds reach the
+//! The model feed taps off BEFORE the noise gate, so quiet sounds reach the
 //! wake-word model unattenuated.
+//!
+//! Exactly one test mode may be enabled; each selects what the listening path
+//! feeds, and the others are not initialised so their arenas cost nothing:
+//!   CHEW_TEST_MODE -> chewallow, 78x24 MFCC, 1024-sample window / 512 hop
+//!   WW_TEST_MODE   -> 4-class wake word, 75x24 MFCC, 480 window / 320 hop
+//!   neither        -> the original MLPerf KWS path, 49x10 MFCC
 //!
 //! Wiring (Apollo4p Blue KXR EVB):
 //!   MEMS mic OUT   -> 1 uF series cap -> J17 "D0N" (= AUDADC SE0)
@@ -39,6 +45,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <math.h>           // sqrtf, for the wake-word window normalization
 
 #include "am_mcu_apollo.h"
 #include "am_bsp.h"
@@ -49,14 +56,15 @@
 
 #include "mic_task.h"
 #include "ae_api.h"         // Ambiq Opus encoder (audio_enc_init / audio_enc_encode_frame)
-//#include "ns_opus_port.h"
 #include "opus.h"
-#include "opus_private.h"    // near your other includes
+#include "opus_private.h"   // OPUS_SET_FORCE_MODE / MODE_CELT_ONLY
 #ifndef KWS_DISABLE
 #include "kws_inference.h"  // TFLite KWS wrapper
 #include "ns_audio_mfcc.h"  // MFCC feature extraction
 #include "chewallow_inference.h"
 #include "chewallow_dummy_input.h"
+#include "ww_inference.h"
+#include "ww_dummy_input.h"
 #endif
 
 //*****************************************************************************
@@ -139,7 +147,8 @@
 // no output at all.
 #define MIC_BIAS_TRIM       63
 
-// BUTTON1 (SW2) = GPIO 19. BUTTON0 (SW1, GPIO 17) is reserved for BLE messages.
+// BUTTON1 (SW2) = GPIO 19. BUTTON0 (SW1, GPIO 17) is polled by ButtonTask in
+// rtos.c, where it sends a BLE message and runs the inference timing harness.
 #define BTN_PIN             19
 
 // Playback: int16 PCM -> 24-bit I2S TX. Left-shift maps int16 full scale into
@@ -149,15 +158,19 @@
 #define PLAY_LIMIT_START    0x500000
 #define PLAY_LIMIT_MAX      0x7FFFFF
 
-// Native AUDADC / I2S sample rate
-#define MIC_NATIVE_RATE     23438
+// AUDADC capture rate. 48 MHz / 8 / 375 = 32,000 exactly.
+#define MIC_NATIVE_RATE     32000
+
+// I2S TX rate. HFRC 1.5 MHz / 64 bits per stereo frame = 23,437.5 Hz.
+// Unchanged by the capture-rate switch -- these are separate clocks.
+#define I2S_NATIVE_RATE     23438
 
 // PCM storage rate -- Opus encoder requires 16 kHz mono int16 input.
 #define REC_PCM_RATE        16000
 #define REC_SECONDS         30
 #define REC_PCM_SAMPLES     (REC_PCM_RATE * REC_SECONDS)
 
-// Opus encoder framing (fixed by SDK library: 20 ms @ 16 kHz, CBR 24 kbit/s)
+// Opus encoder framing (20 ms @ 16 kHz, CBR 24 kbit/s -> 60 bytes per frame)
 #define USE_OPUS14          1     // 1 = neuralSPOT opus1.4 (fixed-point), 0 = Ambiq ae_api blob
 #define OPUS_FRAME_SAMPLES  320
 #define OPUS_FRAME_BYTES    60
@@ -170,13 +183,36 @@ static uint32_t g_encMem[OPUS_ENC_MEM_WORDS];
 //   Capture:  out=16000 from in=23438 -> step = 23438/16000 ~ 1.4649
 //   Playback: out=23438 from in=16000 -> step = 16000/23438 ~ 0.6826
 #define CAP_STEP_Q16  (uint32_t)(((uint64_t)MIC_NATIVE_RATE << 16) / REC_PCM_RATE)
-#define PLAY_STEP_Q16 (uint32_t)(((uint64_t)REC_PCM_RATE   << 16) / MIC_NATIVE_RATE)
+#define PLAY_STEP_Q16 (uint32_t)(((uint64_t)REC_PCM_RATE << 16) / I2S_NATIVE_RATE)
 
 // Per-second stats: 23438 Hz / 128 mono samples per ISR ~ 183 ISR calls/sec.
-#define SEC_CHUNKS          183
+#define SEC_CHUNKS          250
 
 #ifndef KWS_DISABLE
+
+//-----------------------------------------------------------------------------
+// WW_TEST_MODE
+//   1 = the listening path feeds the wake word model. KWS and chewallow are
+//       not initialised at all, so their tensor arenas cost nothing.
+//   0 = the original KWS path, with chewallow available on the button harness.
+//-----------------------------------------------------------------------------
+#define WW_TEST_MODE        0
+#define CHEW_TEST_MODE      1
+
+#if WW_TEST_MODE && CHEW_TEST_MODE
+#error "WW_TEST_MODE and CHEW_TEST_MODE are mutually exclusive"
+#endif
+
+// --- audio framing shared by both paths --------------------------------------
+#if CHEW_TEST_MODE
+// Chewallow hops 512 samples (winstep 0.032 @ 16 kHz), so one ISR chunk is
+// exactly one hop. 320 does not divide 512 and the buffer would drift.
+#define KWS_FRAME_SAMPLES   512
+#else
 #define KWS_FRAME_SAMPLES   320     // 20 ms @ 16 kHz
+#endif
+
+// --- original MLPerf KWS front end -------------------------------------------
 #define KWS_MFCC_COEFFS     10
 #define KWS_MFCC_FBANK_BINS 40
 #define KWS_MFCC_FRAME_POW2 512
@@ -185,34 +221,228 @@ static uint32_t g_encMem[OPUS_ENC_MEM_WORDS];
 // offsets by sizeof(T) on a T* pointer, inflating the layout by 4x. The
 // buffers don't overlap as long as the arena is large enough; 64 KB is plenty.
 #define MFCC_ARENA_BYTES    (64 * 1024)
+
+//-----------------------------------------------------------------------------
+// Wake word front end.
+//
+// These MUST match the training config exactly:
+//   n_mfcc 24, nfilt 40, nfft 512, winlen 0.030, winstep 0.020,
+//   lowfreq 20, highfreq 4000, experiment 2 (coefficient 0 retained)
+//
+// The important one is WW_MFCC_WINLEN_SAMP. Training used a 30 ms window with
+// a 20 ms hop, so consecutive analysis windows OVERLAP by 160 samples. The
+// ISR hands over 320-sample (20 ms) chunks, so a 480-sample window has to be
+// assembled from the previous chunk's tail plus the new chunk -- see
+// g_wwWindow. Passing the raw 320-sample buffer would read past the end of it
+// and compute features from a different window length than training used,
+// which shows up as poor accuracy rather than an error.
+//
+// Note the original KWS config sets frame_len 320 while frame_len_ms says 30;
+// those disagree, so do not copy it as a template.
+//-----------------------------------------------------------------------------
+#define WW_MFCC_COEFFS        24
+#define WW_MFCC_FBANK_BINS    40
+#define WW_MFCC_FRAME_POW2    512
+#define WW_MFCC_LOW_FREQ      20
+#define WW_MFCC_HIGH_FREQ     4000
+#define WW_MFCC_WINLEN_SAMP   480   // 30 ms analysis window
+#define WW_MFCC_HOP_SAMP      320   // 20 ms hop -- equals KWS_FRAME_SAMPLES
+#define WW_MFCC_ARENA_BYTES   (64 * 1024)
+
+// Frames between inferences. 38 x 20 ms = 760 ms, so a 1.5 s window advances
+// about half its length each time and a phrase that straddles one window
+// boundary still lands inside the next. Raise to cut CPU, lower for more
+// chances to catch a phrase.
+#define WW_HOP_FRAMES         38
+
+// Peak of the audio since the last inference must exceed this to bother
+// running the model. Without a gate the model runs on room noise all day.
+#define WW_PEAK_GATE          1000
+
+// Report a detection when a non-nothing class exceeds this. Deliberately low
+// for testing; measured operating points for deployment are 0.99+.
+#define WW_REPORT_THRESHOLD   0.99f
+
+// Print a line on every inference, not just detections. Useful at first, then
+// set to 0 once the log gets noisy.
+#define WW_VERBOSE            1
+
+// Run the embedded-wav test once at boot. Set to 0 when the front end is
+// proven -- the embedded wav costs 48 KB of flash.
+#define WW_SELFTEST           1
+
+// Two 320-sample chunks. The analysis window is the FIRST 480 of these.
+//
+// Python frame k spans samples [k*320, k*320+480). Keeping only the most
+// recent 480 samples would place every frame half a hop (10 ms) later than
+// training did.
+#define WW_MFCC_BUF_SAMP      (2 * WW_MFCC_HOP_SAMP)   /* 640 */
+
+// Preemphasis: y[n] = x[n] - 0.97*x[n-1], over the CONTINUOUS stream.
+//
+// python_speech_features defaults to preemph=0.97 and applies it to the whole
+// signal BEFORE framing, so every frame's first sample depends on the
+// previous frame's last one. ns_mfcc_compute only ever sees an isolated
+// buffer and cannot reproduce that by itself.
+//
+// Measured: MFCCs computed on isolated 480-sample slices differ from psf by
+// up to 30 units per coefficient, against typical magnitudes of 20-30.
+// Preemphasizing the continuous stream first and then slicing matches psf
+// exactly (diff 0.000000). Not a rounding-level concern.
+#define WW_PREEMPH_Q15        31785   /* 0.97 * 32768 */
+
+// ns_mfcc rounds its output to a whole number -- ns_mfcc.c line ~188 does
+//     sum *= (0x1 << cfg->num_dec_bits);
+//     sum = round(sum);
+// unconditionally, even though mfcc_out is a float*. num_dec_bits is
+// therefore the only thing preserving fractional precision.
+//
+// At 0 the coefficients came back as integers. With typical MFCC magnitudes
+// of 1-60 that flattened coefficients 5-23 to 0 or +/-1, and the model saw a
+// near-constant vector. 10 bits gives ~0.001 resolution; the scaling is
+// divided back out after every ns_mfcc_compute call.
+#define WW_MFCC_DEC_BITS      10
+#define WW_MFCC_DEC_SCALE     (1.0f / (float)(1 << WW_MFCC_DEC_BITS))
+
+//-----------------------------------------------------------------------------
+// Chewallow front end. Must match the DS5 mfcc_creator_instructions exactly:
+//   n_mfcc 24, nfilt 32, nfft 1024, winlen 0.064, winstep 0.032,
+//   lowfreq 20, highfreq 8000, experiment 2
+//
+// Simpler framing than the wake word: winlen is exactly 2 x winstep, so a
+// 1024-sample buffer holding the last two chunks IS the analysis window. No
+// partial read as the wake word's 480/320 required.
+//-----------------------------------------------------------------------------
+#if CHEW_TEST_MODE
+#define CHEW_MFCC_COEFFS        24
+#define CHEW_MFCC_FBANK_BINS    32
+#define CHEW_MFCC_FRAME_POW2    1024
+#define CHEW_MFCC_LOW_FREQ      20
+#define CHEW_MFCC_HIGH_FREQ     8000
+#define CHEW_MFCC_WINLEN_SAMP   1024   // 64 ms window
+#define CHEW_MFCC_HOP_SAMP      512    // 32 ms hop = the feed chunk
+
+// nfft 1024 needs ~4x the wake word's arena, and ns_mfcc_map_arena inflates
+// its layout 4x on top of that.
+#define CHEW_MFCC_ARENA_BYTES   (128 * 1024)
+
+// Frames between inferences. 78 = no overlap (production cadence, one per
+// 2.5 s). 39 halves it for testing so a chewing burst gets two chances.
+#define CHEW_HOP_FRAMES         78
+
+#define CHEW_PEAK_GATE          300      // chewing is quiet
+#define CHEW_REPORT_THRESHOLD   0.35f
+#define CHEW_VERBOSE            1
+
+// ns_mfcc round()s its output unconditionally -- see the WW note above.
+#define CHEW_MFCC_DEC_BITS      10
+#define CHEW_MFCC_DEC_SCALE     (1.0f / (float)(1 << CHEW_MFCC_DEC_BITS))
+#define CHEW_PREEMPH_Q15        31785   // 0.97 * 32768
+
+#if CHEW_MFCC_COEFFS != CHEWALLOW_NUM_COEFFS
+#error "CHEW_MFCC_COEFFS must match CHEWALLOW_NUM_COEFFS"
 #endif
+#if CHEW_MFCC_HOP_SAMP != KWS_FRAME_SAMPLES
+#error "The feed chunk must equal the MFCC hop"
+#endif
+#endif  // CHEW_TEST_MODE
+
+
+
+#if WW_MFCC_COEFFS != WW_NUM_COEFFS
+#error "WW_MFCC_COEFFS must match WW_NUM_COEFFS in ww_inference.h"
+#endif
+
+// Must come AFTER the defines above: the guard depends on WW_SELFTEST, and
+// the buffer further down is sized from WW_TEST_AUDIO_SAMPLES.
+#if WW_TEST_MODE && WW_SELFTEST
+#include "ww_test_audio.h"   // g_ww_test_audio[], from tools/wav_to_header.py
+#endif
+
+#endif  // KWS_DISABLE
 
 //*****************************************************************************
 // DMA buffers -- shared SRAM, 16-byte aligned
 //*****************************************************************************
 
 #ifndef KWS_DISABLE
-// KWS ping-pong (ISR fills one while task reads the other)
-MIC_NOLOAD static int16_t  g_kwsBuf[2][KWS_FRAME_SAMPLES];
+// Model feed ping-pong (ISR fills one while task reads the other). Shared by
+// both the KWS and wake-word paths -- both consume 20 ms chunks.
+MIC_NOLOAD static int16_t    g_kwsBuf[2][KWS_FRAME_SAMPLES];
 static volatile uint32_t     g_kwsWriteBuf = 0;
 static volatile uint32_t     g_kwsWritePos = 0;
 static volatile uint32_t     g_kwsReadyBuf = 0xFF;
 
-MIC_NOLOAD static uint8_t  g_mfccArena[MFCC_ARENA_BYTES];
+// Software gain on the model feed only -- brings the AUDADC PCM into the range
+// Google Speech Commands was trained on, without touching the recording path.
+// Saturates to int16 full scale.
+//
+// For the wake word this matters less than it looks: the 75x24 window is
+// z-score normalized before inference, so absolute level is removed. Gain
+// only affects clipping and the peak gate. If loud speech looks clipped,
+// try 1 and halve WW_PEAK_GATE.
+#define KWS_SW_GAIN          1
+
+// Energy gate for the KWS path: peak |sample| over the 1-second window must
+// exceed this to invoke the model. Below it, force-classify as silence --
+// eliminates the "go"/"yes" hallucinations the DS-CNN emits on AUDADC noise.
+#define KWS_PEAK_GATE        1000
+static volatile int32_t      g_kwsWindowPeak = 0;
+
+#if !WW_TEST_MODE
+MIC_NOLOAD static uint8_t    g_mfccArena[MFCC_ARENA_BYTES];
 static float                 g_mfccFeatures[KWS_NUM_FRAMES * KWS_NUM_COEFFS];
 static uint32_t              g_mfccFrameCount = 0;
 static ns_mfcc_cfg_t         g_mfccCfg;
+#endif
 
-// Software gain applied only on the KWS feed -- brings the AUDADC PCM into the
-// range Google Speech Commands was trained on without touching the recording
-// path. Saturates to int16 full scale.
-#define KWS_SW_GAIN          2
+#if WW_TEST_MODE
+MIC_NOLOAD static uint8_t g_wwMfccArena[WW_MFCC_ARENA_BYTES];
+static ns_mfcc_cfg_t      g_wwMfccCfg;
 
-// Energy gate: peak |sample| over the 1-second KWS window must exceed this to
-// invoke the model. Below it, force-classify as silence -- eliminates the
-// "go"/"yes" hallucinations the DS-CNN model emits on AUDADC residual noise.
-#define KWS_PEAK_GATE        2000   //2000
-static volatile int32_t      g_kwsWindowPeak = 0;
+// 75 frames x 24 coefficients, float32
+static float    g_wwFeatures[WW_NUM_FRAMES * WW_MFCC_COEFFS];
+static uint32_t g_wwFrameCount = 0;
+
+// Rolling two-chunk buffer of PREEMPHASIZED audio. ns_mfcc_compute reads the
+// first WW_MFCC_WINLEN_SAMP (480) of it, which is exactly Python's frame k.
+// The 160-sample overlap between consecutive frames falls out of the 320
+// sample hop across a 480 sample window.
+static int16_t g_wwWindow[WW_MFCC_BUF_SAMP];      // 640, preemphasized
+static bool    g_wwPrimed = false;   // needs two chunks before the first MFCC
+static int16_t g_wwPreemphPrev = 0;  // last RAW sample of the previous chunk
+
+#if WW_SELFTEST
+// Preemphasized copy of the embedded test clip. In .sram_bss rather than
+// plain .bss so it does not compete with the tensor arenas for TCM.
+MIC_NOLOAD static int16_t g_wwPreBuf[WW_TEST_AUDIO_SAMPLES];
+#endif
+
+// Peak since the last inference, for the energy gate. Tracked separately from
+// g_kwsWindowPeak because the wake-word window is a different length.
+static volatile int32_t g_wwWindowPeak = 0;
+
+// MFCC milliseconds accumulated across the frames of one inference window.
+static uint32_t g_wwMfccMsAccum = 0;
+static uint32_t g_wwInferCount  = 0;
+
+#elif CHEW_TEST_MODE
+MIC_NOLOAD static uint8_t g_chewMfccArena[CHEW_MFCC_ARENA_BYTES];
+static ns_mfcc_cfg_t      g_chewMfccCfg;
+
+static float    g_chewFeatures[CHEWALLOW_NUM_FRAMES * CHEW_MFCC_COEFFS];
+static uint32_t g_chewFrameCount = 0;
+
+// The analysis window: last two 512-sample chunks, preemphasized.
+static int16_t  g_chewWindow[CHEW_MFCC_WINLEN_SAMP];
+static bool     g_chewPrimed = false;
+static int16_t  g_chewPreemphPrev = 0;
+
+static volatile int32_t g_chewWindowPeak = 0;
+static uint32_t g_chewMfccMsAccum = 0;
+static uint32_t g_chewInferCount  = 0;
+
+#endif
 #endif
 
 // AUDADC ping+pong contiguous buffer (HAL alternates halves automatically).
@@ -225,7 +455,7 @@ MIC_NOLOAD static uint32_t g_txBufRawB[2 * MIC_DMA_SAMPLES + 3];
 //*****************************************************************************
 // Recording buffers (in shared SRAM)
 //   g_pcmBuf  -- 16 kHz int16 mono PCM, used for on-device playback
-//   g_opusBuf -- Opus 32 kbit/s CBR, ready for BLE transmission
+//   g_opusBuf -- Opus 24 kbit/s CBR, ready for BLE transmission
 //*****************************************************************************
 
 MIC_NOLOAD static int16_t g_pcmBuf[REC_PCM_SAMPLES];
@@ -265,9 +495,9 @@ static volatile bool       g_playDone = false;
 static volatile uint32_t   g_tonePos  = 0;
 static volatile bool       g_toneDone = false;
 
-// Capture-side resampler state (23438 Hz int16-scaled -> 16000 Hz int16)
-static volatile int32_t   g_capLast       = 0;
-static volatile uint32_t  g_capAccum      = 0;
+// 2:1 decimation state. Flips on every input sample; the sample is kept when
+// it lands back on zero, so exactly half are stored.
+static volatile uint32_t  g_capToggle     = 0;
 
 // DC blocker (single-pole IIR HPF). The mic has a measurable DC bias at the
 // AUDADC pin; leaving it in skews FFT bin 0 and any subsequent feature.
@@ -277,23 +507,56 @@ static volatile uint32_t  g_capAccum      = 0;
 static volatile int32_t   g_dcPrevIn      = 0;
 static volatile int32_t   g_dcPrevOut     = 0;
 
+//*****************************************************************************
+// Capture anti-alias filter: 4th-order Butterworth, fc 7 kHz @ 32 kHz.
+// Two cascaded biquads, pole Qs 0.5412 and 1.3066.
+//
+// Replaces the 2nd-order 4 kHz filter, which was designed for the old
+// 23,438 Hz capture rate. Biquad coefficients encode frequency as a fraction
+// of the sample rate, so moving to 32 kHz already dragged that corner up to
+// 5,469 Hz on its own.
+//
+// Why 7 kHz: measured on unblended chewing snippets, the 4-8 kHz band holds
+// only 9.2% of chewing energy but separates from background by +12.91 dB --
+// better than the +10.73 dB below 4 kHz -- and its per-snippet energy is
+// uncorrelated with the low band (r = 0.219). Quiet, but not redundant.
+// Restricting the MFCC to 4 kHz cost ~3 accuracy points (DS1 vs DS2).
+//
+// Response: -0.0 dB at 4k, -0.8 at 6k, -3.0 at 7k, -7.7 at 8k, -20.9 at 10k,
+// -37.5 at 12k. The 8 kHz figure is weaker than the old filter's -19.6 dB,
+// which is the unavoidable trade: 8 kHz is both where signal ends and where
+// folding begins.
+//
+// NOT volatile -- only the ISR touches these, so the compiler can keep them
+// in registers instead of reloading from memory every sample.
+//*****************************************************************************
+#define AA1_B0     0.211137f
+#define AA1_B1     0.422275f
+#define AA1_A1_N   0.204698f
+#define AA1_A2_N  -0.049248f
+
+#define AA2_B0     0.292624f
+#define AA2_B1     0.585248f
+#define AA2_A1_N   0.283700f
+#define AA2_A2_N  -0.454196f
+
+static float g_aa1X1 = 0.0f, g_aa1X2 = 0.0f, g_aa1Y1 = 0.0f, g_aa1Y2 = 0.0f;
+static float g_aa2X1 = 0.0f, g_aa2X2 = 0.0f, g_aa2Y1 = 0.0f, g_aa2Y2 = 0.0f;
+
+
 // Anti-alias / de-hiss biquad LPF (Butterworth 2nd order, fc~4 kHz @ 23.438 kHz,
 // Q=0.707). Content above 8 kHz folds back into the audio band as hiss through
 // the 23.438->16 kHz decimator. 4 kHz cutoff preserves speech (0.3-3.4 kHz).
 //   y[n] = b0(x[n] + x[n-2]) + b1*x[n-1] + a1_n*y[n-1] + a2_n*y[n-2]
 //
-// NOTE for model work: this runs ahead of BOTH the recording path and the KWS
-// feed, so anything above 4 kHz is gone before any model sees it. If a model
-// was trained on wider-band audio (e.g. chewing, which has high-frequency
-// content), that is a train/inference mismatch worth checking.
+// NOTE for model work: this runs ahead of BOTH the recording path and the model
+// feed, so anything above 4 kHz is gone before any model sees it. The wake-word
+// MFCC therefore uses highfreq 4000 to match -- see WW_MFCC_HIGH_FREQ.
 #define LPF_B0     0.1615f
 #define LPF_B1     0.3231f
 #define LPF_A1_N   0.5871f
 #define LPF_A2_N  -0.2333f
-static volatile float     g_lpfX1         = 0.0f;
-static volatile float     g_lpfX2         = 0.0f;
-static volatile float     g_lpfY1         = 0.0f;
-static volatile float     g_lpfY2         = 0.0f;
+
 
 //*****************************************************************************
 // Downward expander (soft noise gate) -- applied ONLY to the recording path.
@@ -318,13 +581,29 @@ static volatile float     g_lpfY2         = 0.0f;
 // (~1000 at CHANNEL_GAIN_DB 24) -- it works because the envelope peaks much
 // higher than RMS. This is aggressive processing tuned for a human listener.
 // Anything quieter than speech is heavily attenuated, so a model that needs to
-// detect quiet events should tap the signal BEFORE this gate, as KWS does.
+// detect quiet events should tap the signal BEFORE this gate, as the model
+// feed does.
 //*****************************************************************************
 #define GATE_THRESH        3500.0f
 #define GATE_FLOOR         0.03f
 #define GATE_ATTACK_A      0.005f     // ~9 ms attack
 #define GATE_RELEASE_A     0.0004f    // slow release -- pop suppression
 static volatile float     g_gateEnv       = 0.0f;
+
+// Gate the recording path, or not.
+//
+// The gate makes audio pleasant for a human listener, but the model feed
+// taps UNGATED. Audio recorded with the gate and inferred on without it are
+// different signals, and a gate is nonlinear and envelope-dependent -- no
+// linear correction can undo it afterwards.
+//
+// Chewing is the worst case: GATE_THRESH 3500 sits above typical chewing
+// level, so the quiet passages that carry the discriminative content get
+// squared down toward GATE_FLOOR.
+//
+// Default false, so recordings are training-safe. Set true only when the
+// recording is meant purely for listening.
+static volatile bool      g_gateRecording = false;
 
 // Playback-side resampler state (16000 Hz int16 -> 23438 Hz int24)
 static volatile uint32_t  g_playPhaseQ16  = 0;
@@ -351,6 +630,16 @@ static volatile int32_t  g_secPeak      = 0;
 static volatile int32_t  g_secPeakLast  = 0;
 static volatile uint32_t g_printReady   = 0;
 static volatile uint32_t g_audadcIsrCount = 0;
+// ISR cost tracking. The ISR preempts every task including the model, so its
+// CPU share comes straight off the 2500 ms window chewallow has to fit in.
+// Sample rate drives this directly -- 32 kHz means ~37% more samples through
+// the DC blocker, biquad and envelope follower than 23,438 Hz does.
+static volatile uint32_t g_isrCycles    = 0;   // accumulated over one second
+static volatile uint32_t g_isrCallCount = 0;
+static volatile uint32_t g_isrCyclesRpt = 0;   // latched for the printf
+static volatile uint32_t g_isrCallsRpt  = 0;
+static volatile uint32_t g_isrSamplesRpt = 0;
+static volatile uint32_t g_isrSamples   = 0;
 static bool              g_micDebug     = true;
 
 //*****************************************************************************
@@ -466,6 +755,186 @@ static inline int32_t soft_limit_i2s24(int32_t sample)
     return sample;
 }
 
+#if !defined(KWS_DISABLE) && (WW_TEST_MODE || CHEW_TEST_MODE)
+//*****************************************************************************
+// Per-window z-score, matching the numpy building script:
+//
+//     temp_mean = np.mean(feat);  feat -= temp_mean
+//     temp_std  = np.std(feat);   feat /= temp_std
+//
+// np.std defaults to the population form (ddof=0), so divide by n, not n-1.
+// A zero standard deviation means a completely flat window; the Python side
+// discards those, so zeroing is the closest equivalent.
+//
+// This is not optional. The model was trained entirely on normalized windows
+// and produces nonsense on raw MFCCs.
+//*****************************************************************************
+static void model_normalize_window(float *feat, uint32_t n)
+{
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n; i++) sum += feat[i];
+    float mean = sum / (float)n;
+
+    float var = 0.0f;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        float d = feat[i] - mean;
+        var += d * d;
+    }
+    float sd = sqrtf(var / (float)n);
+
+    if (sd > 0.0f)
+    {
+        for (uint32_t i = 0; i < n; i++) feat[i] = (feat[i] - mean) / sd;
+    }
+    else
+    {
+        for (uint32_t i = 0; i < n; i++) feat[i] = 0.0f;
+    }
+}
+#endif
+
+#if !defined(KWS_DISABLE) && WW_TEST_MODE && WW_SELFTEST
+//*****************************************************************************
+// One-shot front-end check against an embedded wav.
+//
+// Runs the identical audio through the firmware MFCC path that Python runs
+// through python_speech_features, so the two can be compared number by
+// number. No microphone, no gain, no timing -- if these disagree the front
+// end is at fault; if they agree and live audio still misbehaves, the problem
+// is in the capture chain.
+//
+// Frame k analyses samples [k*320, k*320+480), matching psf with
+// winlen=0.030 winstep=0.020 on a 24000-sample clip: exactly 75 frames.
+//*****************************************************************************
+static void ww_selftest(void)
+{
+    am_util_stdio_printf("\n===== WW MFCC SELF-TEST =====\n");
+    am_util_stdio_printf("audio: %d samples\n", WW_TEST_AUDIO_SAMPLES);
+
+    // Peak and RMS, so the embedded array can be checked against the wav.
+    int32_t peak = 0;
+    int64_t sumsq = 0;
+    for (int i = 0; i < WW_TEST_AUDIO_SAMPLES; i++)
+    {
+        int32_t a = g_ww_test_audio[i] < 0 ? -g_ww_test_audio[i]
+                                           : g_ww_test_audio[i];
+        if (a > peak) peak = a;
+        sumsq += (int64_t)g_ww_test_audio[i] * g_ww_test_audio[i];
+    }
+    am_util_stdio_printf("peak=%ld rms=%ld\n",
+                         (long)peak,
+                         (long)sqrtf((float)sumsq / WW_TEST_AUDIO_SAMPLES));
+
+    // Preemphasize the WHOLE clip first, exactly as psf does, then slice.
+    // Doing it per frame leaves each frame's first sample un-differenced,
+    // which acts like an impulse and smears energy across every coefficient.
+    int16_t prev = 0;
+    for (int i = 0; i < WW_TEST_AUDIO_SAMPLES; i++)
+    {
+        int32_t y = (int32_t)g_ww_test_audio[i]
+                  - (((int32_t)prev * WW_PREEMPH_Q15) >> 15);
+        if (y >  32767) y =  32767;
+        if (y < -32768) y = -32768;
+        g_wwPreBuf[i] = (int16_t)y;
+        prev = g_ww_test_audio[i];
+    }
+
+    for (uint32_t k = 0; k < WW_NUM_FRAMES; k++)
+    {
+        uint32_t start = k * WW_MFCC_HOP_SAMP;
+if (start + WW_MFCC_WINLEN_SAMP > WW_TEST_AUDIO_SAMPLES)
+        {
+            // psf zero-pads the final partial frame.
+            int16_t padded[WW_MFCC_WINLEN_SAMP];
+            memset(padded, 0, sizeof(padded));
+            uint32_t avail = (start < WW_TEST_AUDIO_SAMPLES)
+                             ? (WW_TEST_AUDIO_SAMPLES - start) : 0;
+            if (avail > WW_MFCC_WINLEN_SAMP) avail = WW_MFCC_WINLEN_SAMP;
+            memcpy(padded, &g_wwPreBuf[start], avail * sizeof(int16_t));
+            ns_mfcc_compute(&g_wwMfccCfg, padded,
+                            &g_wwFeatures[k * WW_MFCC_COEFFS]);
+        }
+        else
+        {
+            ns_mfcc_compute(&g_wwMfccCfg, &g_wwPreBuf[start],
+                            &g_wwFeatures[k * WW_MFCC_COEFFS]);
+        }
+
+        // Undo the num_dec_bits scaling applied before ns_mfcc's round().
+        for (uint32_t c = 0; c < WW_MFCC_COEFFS; c++)
+            g_wwFeatures[k * WW_MFCC_COEFFS + c] *= WW_MFCC_DEC_SCALE;
+    }
+
+    // RAW coefficients, before normalization -- these compare directly
+    // against python_speech_features' mfcc() output. Scaled by 1000 because
+    // am_util_stdio_printf has no float support.
+    const uint32_t dump_frames[] = {0, 1, 2, 37, 74};
+    for (uint32_t d = 0; d < sizeof(dump_frames) / sizeof(dump_frames[0]); d++)
+    {
+        uint32_t k = dump_frames[d];
+        am_util_stdio_printf("RAW f%02lu:", (unsigned long)k);
+        for (uint32_t c = 0; c < WW_MFCC_COEFFS; c++)
+            am_util_stdio_printf(" %d",
+                (int)(g_wwFeatures[k * WW_MFCC_COEFFS + c] * 1000.0f));
+        am_util_stdio_printf("\n");
+    }
+
+    // Whole-array statistics: a fast way to spot a scale or offset error
+    // without reading 1800 numbers.
+    float mn = g_wwFeatures[0], mx = g_wwFeatures[0], sum = 0.0f;
+    for (uint32_t i = 0; i < WW_NUM_FRAMES * WW_MFCC_COEFFS; i++)
+    {
+        float v = g_wwFeatures[i];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        sum += v;
+    }
+    float mean = sum / (WW_NUM_FRAMES * WW_MFCC_COEFFS);
+    float var = 0.0f;
+    for (uint32_t i = 0; i < WW_NUM_FRAMES * WW_MFCC_COEFFS; i++)
+    {
+        float d2 = g_wwFeatures[i] - mean;
+        var += d2 * d2;
+    }
+    am_util_stdio_printf("RAW stats: min=%d max=%d mean=%d std=%d (x1000)\n",
+                         (int)(mn * 1000.0f), (int)(mx * 1000.0f),
+                         (int)(mean * 1000.0f),
+                         (int)(sqrtf(var / (WW_NUM_FRAMES * WW_MFCC_COEFFS))
+                               * 1000.0f));
+
+    // Normalize and run, as the live path does.
+    model_normalize_window(g_wwFeatures, WW_NUM_FRAMES * WW_MFCC_COEFFS);
+
+    am_util_stdio_printf("NORM f00:");
+    for (uint32_t c = 0; c < WW_MFCC_COEFFS; c++)
+        am_util_stdio_printf(" %d", (int)(g_wwFeatures[c] * 1000.0f));
+    am_util_stdio_printf("\n");
+
+    float probs[WW_NUM_CLASSES] = {0};
+    TickType_t t0 = xTaskGetTickCount();
+    int best = ww_run(g_wwFeatures, probs);
+    uint32_t ms = (uint32_t)(xTaskGetTickCount() - t0);
+
+    am_util_stdio_printf("RESULT: %s  n=%d iam=%d note=%d life=%d  (%lu ms)\n",
+                         (best >= 0) ? ww_label_names[best] : "error",
+                         (int)(probs[WW_IDX_NOTHING] * 100.0f),
+                         (int)(probs[WW_IDX_IAM] * 100.0f),
+                         (int)(probs[WW_IDX_NOTE] * 100.0f),
+                         (int)(probs[WW_IDX_LIFEIKO] * 100.0f),
+                         (unsigned long)ms);
+    am_util_stdio_printf("===== END SELF-TEST =====\n\n");
+
+    // Leave no state behind for the live path.
+    memset(g_wwFeatures, 0, sizeof(g_wwFeatures));
+    memset(g_wwWindow, 0, sizeof(g_wwWindow));
+    g_wwFrameCount  = 0;
+    g_wwPrimed      = false;
+    g_wwPreemphPrev = 0;
+}
+#endif
+
+
 //*****************************************************************************
 // ISR -- AUDADC0
 // Capture chain: extract -> DC block -> LPF -> envelope -> decimate -> gate
@@ -489,6 +958,8 @@ void am_audadc0_isr(void)
     const uint32_t *rxBuf =
         (const uint32_t *)am_hal_audadc_dma_get_buffer(g_pAUDADCHandle);
 
+    uint32_t cyc0 = DWT->CYCCNT;
+
     int32_t sumAbs = 0;
     for (uint32_t i = 0; i < AUDADC_DMA_WORDS; i++)
     {
@@ -504,16 +975,23 @@ void am_audadc0_isr(void)
         g_dcPrevIn  = xo_raw;
         g_dcPrevOut = xo_dc;
 
-        // --- 4 kHz biquad LPF ---
+        // --- 7 kHz 4th-order anti-alias LPF, two cascaded biquads ---
         float xf = (float)xo_dc;
-        float yf = LPF_B0 * (xf + g_lpfX2)
-                 + LPF_B1 * g_lpfX1
-                 + LPF_A1_N * g_lpfY1
-                 + LPF_A2_N * g_lpfY2;
-        g_lpfX2 = g_lpfX1;
-        g_lpfX1 = xf;
-        g_lpfY2 = g_lpfY1;
-        g_lpfY1 = yf;
+
+        float y1 = AA1_B0 * (xf + g_aa1X2)
+                 + AA1_B1 * g_aa1X1
+                 + AA1_A1_N * g_aa1Y1
+                 + AA1_A2_N * g_aa1Y2;
+        g_aa1X2 = g_aa1X1;  g_aa1X1 = xf;
+        g_aa1Y2 = g_aa1Y1;  g_aa1Y1 = y1;
+
+        float yf = AA2_B0 * (y1 + g_aa2X2)
+                 + AA2_B1 * g_aa2X1
+                 + AA2_A1_N * g_aa2Y1
+                 + AA2_A2_N * g_aa2Y2;
+        g_aa2X2 = g_aa2X1;  g_aa2X1 = y1;
+        g_aa2Y2 = g_aa2Y1;  g_aa2Y1 = yf;
+
         int32_t xo = (int32_t)yf;
 
         // --- Gate envelope follower (asymmetric: fast attack, slow release) ---
@@ -528,33 +1006,41 @@ void am_audadc0_isr(void)
         sumAbs += ao;
         if (ao > g_secPeak) g_secPeak = ao;
 
-        // --- Decimate 23438 -> 16000 (active in LISTENING and RECORDING) ---
+        // --- Decimate 32000 -> 16000, exactly 2:1 ---
+        // Keep every other sample. No phase accumulator, no interpolation,
+        // no jitter. The old 23,438 -> 16,000 ratio was 1.4649, which forced
+        // linear interpolation between neighbours -- a poor reconstruction
+        // filter whose passband droop and imaging the 4 kHz LPF was partly
+        // compensating for.
         if (g_mode == MODE_LISTENING || g_mode == MODE_RECORDING)
         {
-            g_capAccum += 65536u;
-            if (g_capAccum >= CAP_STEP_Q16)
+            g_capToggle ^= 1u;
+            if (g_capToggle == 0)
             {
-                g_capAccum -= CAP_STEP_Q16;
-                int32_t frac = (int32_t)g_capAccum;
-                int32_t diff = xo - g_capLast;
-                int32_t s16  = g_capLast +
-                               (int32_t)(((int64_t)diff * frac) >> 16);
+                int32_t s16 = xo;
                 if (s16 >  32767) s16 =  32767;
                 if (s16 < -32768) s16 = -32768;
 
+
                 if (g_mode == MODE_RECORDING && g_recPos < REC_PCM_SAMPLES)
                 {
-                    // --- Noise gate, recording path only ---
-                    float gate_gain;
-                    if (g_gateEnv >= GATE_THRESH)
+                    // --- Noise gate, recording path only, and only when
+                    //     g_gateRecording is set. See the note at its
+                    //     declaration: gated recordings are not usable as
+                    //     training data for a model that infers ungated.
+                    float gate_gain = 1.0f;
+                    if (g_gateRecording)
                     {
-                        gate_gain = 1.0f;
-                    }
-                    else
-                    {
-                        float r = g_gateEnv * (1.0f / GATE_THRESH);
-                        gate_gain = r * r;
-                        if (gate_gain < GATE_FLOOR) gate_gain = GATE_FLOOR;
+                        if (g_gateEnv >= GATE_THRESH)
+                        {
+                            gate_gain = 1.0f;
+                        }
+                        else
+                        {
+                            float r = g_gateEnv * (1.0f / GATE_THRESH);
+                            gate_gain = r * r;
+                            if (gate_gain < GATE_FLOOR) gate_gain = GATE_FLOOR;
+                        }
                     }
                     int32_t s16g = (int32_t)((float)s16 * gate_gain);
                     if (s16g >  32767) s16g =  32767;
@@ -562,8 +1048,8 @@ void am_audadc0_isr(void)
                     g_pcmBuf[g_recPos++] = (int16_t)s16g;
                 }
 #ifndef KWS_DISABLE
-                // KWS feed taps in UNGATED, so quiet speech still reaches the
-                // wake-word model.
+                // Model feed taps in UNGATED, so quiet speech still reaches
+                // the model unattenuated.
                 else if (g_mode == MODE_LISTENING && g_kwsReadyBuf == 0xFF)
                 {
                     int32_t kg = (int32_t)s16 * KWS_SW_GAIN;
@@ -571,6 +1057,11 @@ void am_audadc0_isr(void)
                     if (kg < -32768) kg = -32768;
                     int32_t ag = (kg < 0) ? -kg : kg;
                     if (ag > g_kwsWindowPeak) g_kwsWindowPeak = ag;
+#if WW_TEST_MODE
+                    if (ag > g_wwWindowPeak) g_wwWindowPeak = ag;
+#elif CHEW_TEST_MODE
+                    if (ag > g_chewWindowPeak) g_chewWindowPeak = ag;
+#endif
 
                     uint32_t wb = g_kwsWriteBuf;
                     g_kwsBuf[wb][g_kwsWritePos++] = (int16_t)kg;
@@ -584,8 +1075,11 @@ void am_audadc0_isr(void)
 #endif
             }
         }
-        g_capLast = xo;
     }
+	
+    g_isrCycles += (DWT->CYCCNT - cyc0);
+    g_isrCallCount++;
+    g_isrSamples += AUDADC_MONO_SAMPLES;
 
     // Auto-stop recording when buffer is full
     if (g_mode == MODE_RECORDING && g_recPos >= REC_PCM_SAMPLES)
@@ -601,6 +1095,12 @@ void am_audadc0_isr(void)
     if (g_dmaBufCount >= SEC_CHUNKS)
     {
         g_secAvg      = g_secSumAbs / (SEC_CHUNKS * AUDADC_MONO_SAMPLES);
+        g_isrCyclesRpt  = g_isrCycles;
+        g_isrCallsRpt   = g_isrCallCount;
+        g_isrSamplesRpt = g_isrSamples;
+        g_isrCycles     = 0;
+        g_isrCallCount  = 0;
+        g_isrSamples    = 0;
         g_secPeakLast = g_secPeak;
         g_secSumAbs   = 0;
         g_secPeak     = 0;
@@ -773,12 +1273,15 @@ static void mic_audadc_init(uint32_t dmaPtrA, uint32_t dmaPtrB)
         .eSampMode      = AM_HAL_AUDADC_SAMPMODE_MED,
     };
 
-    // IRTT: HFRC 48 MHz / div32 / (63+1) = 23,437.5 Hz -- matches I2S TX rate.
+    // 48 MHz / 8 / 375 = 32,000.0 Hz exactly. Was DIV32 with count 63,
+    // giving 23,437.5 Hz and a non-integer 1.4649 ratio to 16 kHz -- which
+    // forced the phase-accumulator resampler. 32 kHz is exactly 2:1, so
+    // decimation becomes "keep every other sample".
     am_hal_audadc_irtt_config_t irttCfg =
     {
         .bIrttEnable      = true,
-        .eClkDiv          = AM_HAL_AUDADC_RPTT_CLK_DIV32,
-        .ui32IrttCountMax = 63,
+        .eClkDiv          = AM_HAL_AUDADC_RPTT_CLK_DIV4,
+        .ui32IrttCountMax = 374,
     };
 
     am_hal_audadc_initialize(0, &g_pAUDADCHandle);
@@ -876,18 +1379,94 @@ void MicTask(void *pvParameters)
     am_util_stdio_printf("[mic] task entered\r\n");
 
 #ifndef KWS_DISABLE
-    // Defer KWS init briefly so BLE can finish reset/advertising bring-up.
-    am_util_stdio_printf("[mic] waiting 3s before kws_init\r\n");
+    // Defer model init briefly so BLE can finish reset/advertising bring-up.
+    am_util_stdio_printf("[mic] waiting 3s before model init\r\n");
     vTaskDelay(pdMS_TO_TICKS(3000));
 
+#if WW_TEST_MODE
+    //-------------------------------------------------------------------------
+    // Wake word test mode. KWS and chewallow are skipped entirely, which
+    // leaves their arenas unallocated -- chewallow's 68 KB in TCM and KWS's
+    // 48 KB plus a 64 KB MFCC arena in .sram_bss.
+    //-------------------------------------------------------------------------
+    am_util_stdio_printf("[mic] >ww_init\r\n");
+    ww_init();
+    am_util_stdio_printf("[mic] <ww_init\r\n");
+
+    g_wwMfccCfg.api              = &ns_mfcc_V1_0_0;
+    g_wwMfccCfg.arena            = g_wwMfccArena;
+    g_wwMfccCfg.sample_frequency = REC_PCM_RATE;          // 16000
+    g_wwMfccCfg.num_fbank_bins   = WW_MFCC_FBANK_BINS;    // 40
+    g_wwMfccCfg.low_freq         = WW_MFCC_LOW_FREQ;      // 20
+    g_wwMfccCfg.high_freq        = WW_MFCC_HIGH_FREQ;     // 4000
+    g_wwMfccCfg.num_frames       = WW_NUM_FRAMES;         // 75
+    g_wwMfccCfg.num_coeffs       = WW_MFCC_COEFFS;        // 24
+    g_wwMfccCfg.num_dec_bits     = WW_MFCC_DEC_BITS;      // see the note above
+    g_wwMfccCfg.frame_shift_ms   = 20;
+    g_wwMfccCfg.frame_len_ms     = 30;
+    g_wwMfccCfg.frame_len        = WW_MFCC_WINLEN_SAMP;   // 480, NOT 320
+    g_wwMfccCfg.frame_len_pow2   = WW_MFCC_FRAME_POW2;    // 512
+
+    am_util_stdio_printf("[mic] >ns_mfcc_init (wake word)\r\n");
+    ns_mfcc_init(&g_wwMfccCfg);
+    am_util_stdio_printf("[mic] <ns_mfcc_init  %d frames x %d coeffs, "
+                         "win %d hop %d, %d-%d Hz, inference every %d frames\r\n",
+                         WW_NUM_FRAMES, WW_MFCC_COEFFS,
+                         WW_MFCC_WINLEN_SAMP, WW_MFCC_HOP_SAMP,
+                         WW_MFCC_LOW_FREQ, WW_MFCC_HIGH_FREQ, WW_HOP_FRAMES);
+
+    memset(g_wwWindow, 0, sizeof(g_wwWindow));
+    memset(g_wwFeatures, 0, sizeof(g_wwFeatures));
+    g_wwFrameCount = 0;
+
+#if WW_SELFTEST
+    ww_selftest();
+#endif
+
+#elif CHEW_TEST_MODE
+    //-------------------------------------------------------------------------
+    // Chewallow test mode. KWS and the wake word are skipped, so their arenas
+    // cost nothing.
+    //-------------------------------------------------------------------------
+    am_util_stdio_printf("[mic] >chewallow_init\r\n");
+    chewallow_init();
+    am_util_stdio_printf("[mic] <chewallow_init\r\n");
+
+    g_chewMfccCfg.api              = &ns_mfcc_V1_0_0;
+    g_chewMfccCfg.arena            = g_chewMfccArena;
+    g_chewMfccCfg.sample_frequency = REC_PCM_RATE;            // 16000
+    g_chewMfccCfg.num_fbank_bins   = CHEW_MFCC_FBANK_BINS;    // 32
+    g_chewMfccCfg.low_freq         = CHEW_MFCC_LOW_FREQ;      // 20
+    g_chewMfccCfg.high_freq        = CHEW_MFCC_HIGH_FREQ;     // 8000
+    g_chewMfccCfg.num_frames       = CHEWALLOW_NUM_FRAMES;    // 78
+    g_chewMfccCfg.num_coeffs       = CHEW_MFCC_COEFFS;        // 24
+    g_chewMfccCfg.num_dec_bits     = CHEW_MFCC_DEC_BITS;      // 10, see note
+    g_chewMfccCfg.frame_shift_ms   = 32;
+    g_chewMfccCfg.frame_len_ms     = 64;
+    g_chewMfccCfg.frame_len        = CHEW_MFCC_WINLEN_SAMP;   // 1024
+    g_chewMfccCfg.frame_len_pow2   = CHEW_MFCC_FRAME_POW2;    // 1024
+
+    am_util_stdio_printf("[mic] >ns_mfcc_init (chewallow)\r\n");
+    ns_mfcc_init(&g_chewMfccCfg);
+    am_util_stdio_printf("[mic] <ns_mfcc_init  %d frames x %d coeffs, "
+                         "win %d hop %d, %d-%d Hz, inference every %d frames\r\n",
+                         CHEWALLOW_NUM_FRAMES, CHEW_MFCC_COEFFS,
+                         CHEW_MFCC_WINLEN_SAMP, CHEW_MFCC_HOP_SAMP,
+                         CHEW_MFCC_LOW_FREQ, CHEW_MFCC_HIGH_FREQ,
+                         CHEW_HOP_FRAMES);
+
+    memset(g_chewWindow, 0, sizeof(g_chewWindow));
+    memset(g_chewFeatures, 0, sizeof(g_chewFeatures));
+    g_chewFrameCount  = 0;
+    g_chewPrimed      = false;
+    g_chewPreemphPrev = 0;
+
+#else
     am_util_stdio_printf("[mic] >kws_init\r\n");
     kws_init();
-	am_util_stdio_printf("[mic] heap: free=%u  min-ever-free=%u  of %u\r\n",
-                     (unsigned)xPortGetFreeHeapSize(),
-                     (unsigned)xPortGetMinimumEverFreeHeapSize(),
-                     (unsigned)configTOTAL_HEAP_SIZE);
     am_util_stdio_printf("[mic] <kws_init\r\n");
-	am_util_stdio_printf("[mic] >chewallow_init\r\n");
+
+    am_util_stdio_printf("[mic] >chewallow_init\r\n");
     chewallow_init();
     am_util_stdio_printf("[mic] <chewallow_init\r\n");
 
@@ -904,9 +1483,15 @@ void MicTask(void *pvParameters)
     g_mfccCfg.frame_len_ms     = 30;
     g_mfccCfg.frame_len        = KWS_FRAME_SAMPLES;
     g_mfccCfg.frame_len_pow2   = KWS_MFCC_FRAME_POW2;
-    am_util_stdio_printf("[mic] >ns_mfcc_init\r\n");
+    am_util_stdio_printf("[mic] >ns_mfcc_init (kws)\r\n");
     ns_mfcc_init(&g_mfccCfg);
     am_util_stdio_printf("[mic] <ns_mfcc_init\r\n");
+#endif
+
+    am_util_stdio_printf("[mic] heap: free=%u  min-ever-free=%u  of %u\r\n",
+                         (unsigned)xPortGetFreeHeapSize(),
+                         (unsigned)xPortGetMinimumEverFreeHeapSize(),
+                         (unsigned)configTOTAL_HEAP_SIZE);
 #endif
 
     am_util_stdio_printf("[mic] >mic_audadc_init\r\n");
@@ -916,6 +1501,13 @@ void MicTask(void *pvParameters)
     am_util_stdio_printf("[mic] >mic_i2s_tx_init\r\n");
     mic_i2s_tx_init(txPtrA, txPtrB);
     am_util_stdio_printf("[mic] <mic_i2s_tx_init\r\n");
+
+    // DWT cycle counter, for measuring ISR cost. Free-running at the CPU
+    // clock; reading it is a single load.
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+    am_util_stdio_printf("[mic] DWT cycle counter enabled\r\n");
 
     am_hal_interrupt_master_enable();
 
@@ -928,8 +1520,20 @@ void MicTask(void *pvParameters)
     am_util_stdio_printf("[mic] I2S TX DMA started\r\n");
 
 #ifndef KWS_DISABLE
+#if CHEW_TEST_MODE
+    am_util_stdio_printf("[mic] Chewallow test mode. %d frames x %d coeffs. "
+                         "Short press=record, long press(2s)=test tone.\n",
+                         CHEWALLOW_NUM_FRAMES, CHEW_MFCC_COEFFS);
+#elif WW_TEST_MODE
+    am_util_stdio_printf("[mic] Wake word test mode. Listening for %s/%s/%s. "
+                         "Short press=record, long press(2s)=test tone.\n",
+                         ww_label_names[WW_IDX_IAM],
+                         ww_label_names[WW_IDX_NOTE],
+                         ww_label_names[WW_IDX_LIFEIKO]);
+#else
     am_util_stdio_printf("[mic] Listening for \"%s\". Short press=record, long press(2s)=test tone.\n",
                          kws_label_names[KWS_TRIGGER_IDX]);
+#endif
 #else
     am_util_stdio_printf("[mic] Ready. Short press=record/play, long press(2s)=test tone.\n");
 #endif
@@ -987,7 +1591,7 @@ void MicTask(void *pvParameters)
                 else
                 {
                     g_recPos    = 0;
-                    g_capAccum  = 0;
+                    g_capToggle = 0;
                     g_opusLen   = 0;
                     g_mode      = MODE_RECORDING;
                     am_util_stdio_printf("[mic] Recording %d sec...\n", REC_SECONDS);
@@ -998,8 +1602,223 @@ void MicTask(void *pvParameters)
         btnPrev = btnDown;
 
 #ifndef KWS_DISABLE
+#if WW_TEST_MODE
+        //---------------------------------------------------------------------
+        // Wake word: one 20 ms hop per ISR handoff, inference every
+        // WW_HOP_FRAMES frames.
+        //---------------------------------------------------------------------
+        uint32_t readyBuf = g_kwsReadyBuf;
+        if (readyBuf != 0xFF && g_mode == MODE_LISTENING)
+        {
+            // Shift out the older chunk, keeping the newer one at the front.
+            memmove(g_wwWindow, &g_wwWindow[WW_MFCC_HOP_SAMP],
+                    WW_MFCC_HOP_SAMP * sizeof(int16_t));
+
+            // Preemphasize the new chunk as it is copied in, carrying the
+            // previous chunk's last RAW sample so the difference is
+            // continuous across the boundary. See WW_PREEMPH_Q15.
+            for (uint32_t i = 0; i < WW_MFCC_HOP_SAMP; i++)
+            {
+                int16_t raw = g_kwsBuf[readyBuf][i];
+                int32_t y = (int32_t)raw
+                          - (((int32_t)g_wwPreemphPrev * WW_PREEMPH_Q15) >> 15);
+                if (y >  32767) y =  32767;
+                if (y < -32768) y = -32768;
+                g_wwWindow[WW_MFCC_HOP_SAMP + i] = (int16_t)y;
+                g_wwPreemphPrev = raw;
+            }
+            g_kwsReadyBuf = 0xFF;
+
+            if (!g_wwPrimed)
+            {
+                // Only one chunk so far, so there is no complete 480-sample
+                // window yet.
+                g_wwPrimed = true;
+                continue;
+            }
+
+            // ns_mfcc_compute reads the FIRST 480 samples of the 640-sample
+            // buffer, which is Python's frame k. Passing the most recent 480
+            // instead would sit half a hop later than training.
+            TickType_t m0 = xTaskGetTickCount();
+            ns_mfcc_compute(&g_wwMfccCfg, g_wwWindow,
+                            &g_wwFeatures[g_wwFrameCount * WW_MFCC_COEFFS]);
+            // Undo the num_dec_bits scaling applied before ns_mfcc's round().
+            for (uint32_t c = 0; c < WW_MFCC_COEFFS; c++)
+                g_wwFeatures[g_wwFrameCount * WW_MFCC_COEFFS + c]
+                    *= WW_MFCC_DEC_SCALE;
+            g_wwMfccMsAccum += (uint32_t)(xTaskGetTickCount() - m0);
+            g_wwFrameCount++;
+
+            if (g_wwFrameCount >= WW_NUM_FRAMES)
+            {
+                int32_t winPeak = g_wwWindowPeak;
+                g_wwWindowPeak = 0;
+
+                if (winPeak >= WW_PEAK_GATE)
+                {
+                    // Normalize the whole 75x24 window, exactly as the numpy
+                    // building script does before training.
+                    model_normalize_window(g_wwFeatures,
+                                        WW_NUM_FRAMES * WW_MFCC_COEFFS);
+
+                    float probs[WW_NUM_CLASSES] = {0};
+                    TickType_t t0 = xTaskGetTickCount();
+                    int best = ww_run(g_wwFeatures, probs);
+                    uint32_t inferMs = (uint32_t)(xTaskGetTickCount() - t0);
+                    g_wwInferCount++;
+
+                    bool detected = (best >= 0 && best != WW_IDX_NOTHING
+                                     && probs[best] >= WW_REPORT_THRESHOLD);
+
+                    if (detected)
+                    {
+                        am_util_stdio_printf(
+                            "[ww] *** %s %d%%  (n=%d iam=%d note=%d life=%d) "
+                            "peak=%ld mfcc=%lu ms infer=%lu ms\n",
+                            ww_label_names[best], (int)(probs[best] * 100.0f),
+                            (int)(probs[WW_IDX_NOTHING] * 100.0f),
+                            (int)(probs[WW_IDX_IAM] * 100.0f),
+                            (int)(probs[WW_IDX_NOTE] * 100.0f),
+                            (int)(probs[WW_IDX_LIFEIKO] * 100.0f),
+                            (long)winPeak,
+                            (unsigned long)g_wwMfccMsAccum,
+                            (unsigned long)inferMs);
+                    }
+#if WW_VERBOSE
+                    else
+                    {
+                        int b = (best < 0) ? WW_IDX_NOTHING : best;
+                        am_util_stdio_printf(
+                            "[ww] %s %d%%  peak=%ld mfcc=%lu ms infer=%lu ms\n",
+                            ww_label_names[b], (int)(probs[b] * 100.0f),
+                            (long)winPeak,
+                            (unsigned long)g_wwMfccMsAccum,
+                            (unsigned long)inferMs);
+                    }
+#endif
+                }
+
+                g_wwMfccMsAccum = 0;
+
+                // Slide the feature buffer instead of resetting, so windows
+                // overlap. A phrase that straddles one window boundary then
+                // still lands inside the next one.
+                memmove(g_wwFeatures,
+                        &g_wwFeatures[WW_HOP_FRAMES * WW_MFCC_COEFFS],
+                        (WW_NUM_FRAMES - WW_HOP_FRAMES) * WW_MFCC_COEFFS
+                            * sizeof(float));
+                g_wwFrameCount = WW_NUM_FRAMES - WW_HOP_FRAMES;
+            }
+        }
+#elif CHEW_TEST_MODE
+        //---------------------------------------------------------------------
+        // Chewallow: one 32 ms hop per ISR handoff, inference every
+        // CHEW_HOP_FRAMES frames.
+        //
+        // winlen is exactly 2 x winstep, so the 1024-sample buffer IS the
+        // analysis window -- shift out the old 512-sample chunk, append the
+        // new one, compute. No partial read as the wake word needed.
+        //---------------------------------------------------------------------
+        uint32_t readyBuf = g_kwsReadyBuf;
+        if (readyBuf != 0xFF && g_mode == MODE_LISTENING)
+        {
+            memmove(g_chewWindow, &g_chewWindow[CHEW_MFCC_HOP_SAMP],
+                    CHEW_MFCC_HOP_SAMP * sizeof(int16_t));
+
+            // Preemphasize as we copy, carrying the previous chunk's last RAW
+            // sample so the difference is continuous across the boundary.
+            // python_speech_features preemphasizes before framing, so each
+            // frame's first sample depends on the previous frame's last.
+            for (uint32_t i = 0; i < CHEW_MFCC_HOP_SAMP; i++)
+            {
+                int16_t raw = g_kwsBuf[readyBuf][i];
+                int32_t y = (int32_t)raw
+                          - (((int32_t)g_chewPreemphPrev * CHEW_PREEMPH_Q15) >> 15);
+                if (y >  32767) y =  32767;
+                if (y < -32768) y = -32768;
+                g_chewWindow[CHEW_MFCC_HOP_SAMP + i] = (int16_t)y;
+                g_chewPreemphPrev = raw;
+            }
+            g_kwsReadyBuf = 0xFF;
+
+            if (!g_chewPrimed)
+            {
+                // One chunk so far -- no complete 1024-sample window yet.
+                g_chewPrimed = true;
+                continue;
+            }
+
+            TickType_t m0 = xTaskGetTickCount();
+            ns_mfcc_compute(&g_chewMfccCfg, g_chewWindow,
+                            &g_chewFeatures[g_chewFrameCount * CHEW_MFCC_COEFFS]);
+            // Undo the num_dec_bits scaling applied before ns_mfcc's round().
+            for (uint32_t c = 0; c < CHEW_MFCC_COEFFS; c++)
+                g_chewFeatures[g_chewFrameCount * CHEW_MFCC_COEFFS + c]
+                    *= CHEW_MFCC_DEC_SCALE;
+            g_chewMfccMsAccum += (uint32_t)(xTaskGetTickCount() - m0);
+            g_chewFrameCount++;
+
+            if (g_chewFrameCount >= CHEWALLOW_NUM_FRAMES)
+            {
+                int32_t winPeak = g_chewWindowPeak;
+                g_chewWindowPeak = 0;
+
+                if (winPeak >= CHEW_PEAK_GATE)
+                {
+                    // Normalize the whole 78x24 window, exactly as the numpy
+                    // building script does before training.
+                    model_normalize_window(g_chewFeatures,
+                        CHEWALLOW_NUM_FRAMES * CHEW_MFCC_COEFFS);
+
+                    float chewProb = 0.0f;
+                    TickType_t t0 = xTaskGetTickCount();
+                    int best = chewallow_run(g_chewFeatures, &chewProb);
+                    uint32_t inferMs = (uint32_t)(xTaskGetTickCount() - t0);
+                    g_chewInferCount++;
+
+                    // Threshold on the probability directly. Requiring
+                    // best == CHEWALLOW_IDX_CHEWALLOW would pin the effective
+                    // threshold at 0.5, since with two classes argmax and
+                    // p >= 0.5 are the same test -- which makes any
+                    // CHEW_REPORT_THRESHOLD below 0.5 unreachable.
+                    if (chewProb >= CHEW_REPORT_THRESHOLD)
+                    {
+                        am_util_stdio_printf(
+                            "[chew] *** CHEWALLOW %d%%  peak=%ld "
+                            "mfcc=%lu ms infer=%lu ms\n",
+                            (int)(chewProb * 100.0f), (long)winPeak,
+                            (unsigned long)g_chewMfccMsAccum,
+                            (unsigned long)inferMs);
+                    }
+#if CHEW_VERBOSE
+                    else
+                    {
+                        am_util_stdio_printf(
+                            "[chew] nothing (p=%d%%)  peak=%ld "
+                            "mfcc=%lu ms infer=%lu ms\n",
+                            (int)(chewProb * 100.0f), (long)winPeak,
+                            (unsigned long)g_chewMfccMsAccum,
+                            (unsigned long)inferMs);
+                    }
+#endif
+                }
+
+                g_chewMfccMsAccum = 0;
+
+                // Slide the feature buffer rather than resetting, so windows
+                // overlap and a chewing burst near a boundary still lands
+                // inside the next one.
+                memmove(g_chewFeatures,
+                        &g_chewFeatures[CHEW_HOP_FRAMES * CHEW_MFCC_COEFFS],
+                        (CHEWALLOW_NUM_FRAMES - CHEW_HOP_FRAMES)
+                            * CHEW_MFCC_COEFFS * sizeof(float));
+                g_chewFrameCount = CHEWALLOW_NUM_FRAMES - CHEW_HOP_FRAMES;
+            }
+        }
+#else
         // ---- KWS: process one 20 ms frame when the ISR hands one over ----
-uint32_t readyBuf = g_kwsReadyBuf;
+        uint32_t readyBuf = g_kwsReadyBuf;
         if (readyBuf != 0xFF && g_mode == MODE_LISTENING)
         {
             float confidence = 0.0f;
@@ -1025,7 +1844,7 @@ uint32_t readyBuf = g_kwsReadyBuf;
                 {
                     int top2_idx = -1;
                     float top2_conf = 0.0f;
-					TickType_t k0 = xTaskGetTickCount();
+                    TickType_t k0 = xTaskGetTickCount();
                     keyword = kws_run_top2(g_mfccFeatures,
                                            &keyword, &confidence,
                                            &top2_idx, &top2_conf);
@@ -1048,12 +1867,13 @@ uint32_t readyBuf = g_kwsReadyBuf;
                     am_util_stdio_printf("[kws] TRIGGER -> recording %d sec...\n",
                                         REC_SECONDS);
                     g_recPos   = 0;
-                    g_capAccum = 0;
+                    g_capToggle = 0;
                     g_opusLen  = 0;
                     g_mode     = MODE_RECORDING;
                 }
             }
         }
+#endif
 #endif
 
         // ---- ISR notifications ----
@@ -1135,45 +1955,45 @@ uint32_t readyBuf = g_kwsReadyBuf;
                 }
             }
 
-            // Encode to Opus (32 kbit/s CBR, 20 ms frames, 16 kHz mono)
+            // Encode to Opus (24 kbit/s CBR, 20 ms frames, 16 kHz mono)
             uint32_t totalFrames = g_recLen / OPUS_FRAME_SAMPLES;
             if (totalFrames > OPUS_NUM_FRAMES) totalFrames = OPUS_NUM_FRAMES;
 
             am_util_stdio_printf("[mic] Encoding %lu Opus frames...\n",
                                  (unsigned long)totalFrames);
-			TickType_t encStartTick = xTaskGetTickCount();
-			
+            TickType_t encStartTick = xTaskGetTickCount();
+
 #if USE_OPUS14
-			static OpusEncoder *g_enc = NULL;
-			if (g_enc == NULL)
-			{
-				int encSize = opus_encoder_get_size(1);
-				am_util_stdio_printf("[mic] opus encoder size: %d bytes (have %d)\n",
-									 encSize, (int)sizeof(g_encMem));
-				if (encSize > (int)sizeof(g_encMem)) {
-					am_util_stdio_printf("[mic] ERROR: encoder buffer too small\n");
-					return;   // or your existing error path
-				}
-				g_enc = (OpusEncoder *)g_encMem;
-				int err = opus_encoder_init(g_enc, 16000, 1, OPUS_APPLICATION_VOIP);
-				if (err != OPUS_OK) {
-					am_util_stdio_printf("[mic] opus_encoder_init failed: %d\n", err);
-					return;
-				}
-				opus_encoder_ctl(g_enc, OPUS_SET_BITRATE(24000));  // was 32000
-				opus_encoder_ctl(g_enc, OPUS_SET_VBR(0));
-				opus_encoder_ctl(g_enc, OPUS_SET_VBR_CONSTRAINT(0));
-				opus_encoder_ctl(g_enc, OPUS_SET_COMPLEXITY(0));
-				opus_encoder_ctl(g_enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
-				opus_encoder_ctl(g_enc, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_WIDEBAND));
-				opus_encoder_ctl(g_enc, OPUS_SET_FORCE_MODE(MODE_CELT_ONLY));
-			}
+            static OpusEncoder *g_enc = NULL;
+            if (g_enc == NULL)
+            {
+                int encSize = opus_encoder_get_size(1);
+                am_util_stdio_printf("[mic] opus encoder size: %d bytes (have %d)\n",
+                                     encSize, (int)sizeof(g_encMem));
+                if (encSize > (int)sizeof(g_encMem)) {
+                    am_util_stdio_printf("[mic] ERROR: encoder buffer too small\n");
+                    return;
+                }
+                g_enc = (OpusEncoder *)g_encMem;
+                int err = opus_encoder_init(g_enc, 16000, 1, OPUS_APPLICATION_VOIP);
+                if (err != OPUS_OK) {
+                    am_util_stdio_printf("[mic] opus_encoder_init failed: %d\n", err);
+                    return;
+                }
+                opus_encoder_ctl(g_enc, OPUS_SET_BITRATE(24000));
+                opus_encoder_ctl(g_enc, OPUS_SET_VBR(0));
+                opus_encoder_ctl(g_enc, OPUS_SET_VBR_CONSTRAINT(0));
+                opus_encoder_ctl(g_enc, OPUS_SET_COMPLEXITY(0));
+                opus_encoder_ctl(g_enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+                opus_encoder_ctl(g_enc, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_WIDEBAND));
+                opus_encoder_ctl(g_enc, OPUS_SET_FORCE_MODE(MODE_CELT_ONLY));
+            }
 #else
-				audio_enc_init(0);
+            audio_enc_init(0);
 #endif
 
             TickType_t initDoneTick = xTaskGetTickCount();
-			
+
             uint32_t opusBytes = 0;
             for (uint32_t f = 0; f < totalFrames; f++)
             {
@@ -1189,32 +2009,32 @@ uint32_t readyBuf = g_kwsReadyBuf;
                             OPUS_FRAME_SAMPLES,
                             &g_opusBuf[opusBytes]);
 #endif
-                if (f < 10 || n != 60)
+                if (f < 10 || n != OPUS_FRAME_BYTES)
                     am_util_stdio_printf("[mic] frame %lu: n=%d\n",
                                          (unsigned long)f, n);
                 if (n <= 0 || opusBytes + n > OPUS_BUF_BYTES) break;
                 opusBytes += (uint32_t)n;
             }
-			
-			TickType_t encDoneTick = xTaskGetTickCount();
+
+            TickType_t encDoneTick = xTaskGetTickCount();
             g_opusLen = opusBytes;
-			
-			uint32_t initMs   = (uint32_t)(initDoneTick - encStartTick);
-			uint32_t encodeMs = (uint32_t)(encDoneTick - initDoneTick);
-			uint32_t totalMs  = (uint32_t)(encDoneTick - encStartTick);
-			
+
+            uint32_t initMs   = (uint32_t)(initDoneTick - encStartTick);
+            uint32_t encodeMs = (uint32_t)(encDoneTick - initDoneTick);
+            uint32_t totalMs  = (uint32_t)(encDoneTick - encStartTick);
+
             am_util_stdio_printf("[mic] Opus encode done: %lu bytes (~%lu kbit/s)\n",
                                  (unsigned long)opusBytes,
                                  (unsigned long)((opusBytes * 8) / REC_SECONDS / 1000));
-								 
-			am_util_stdio_printf("[mic] Encode timing: init=%lu ms, encode=%lu ms, total=%lu ms (%lu frames, %lu us/frame)\n",
+
+            am_util_stdio_printf("[mic] Encode timing: init=%lu ms, encode=%lu ms, total=%lu ms (%lu frames, %lu us/frame)\n",
                                  (unsigned long)initMs,
                                  (unsigned long)encodeMs,
                                  (unsigned long)totalMs,
                                  (unsigned long)totalFrames,
                                  (unsigned long)(totalFrames > 0 ? (encodeMs * 1000UL) / totalFrames : 0));
-			
-#ifndef KWS_DISABLE
+
+#if !defined(KWS_DISABLE) && !WW_TEST_MODE && !CHEW_TEST_MODE
             {
                 float chewProb = 0.0f;
                 TickType_t cw0 = xTaskGetTickCount();
@@ -1225,12 +2045,28 @@ uint32_t readyBuf = g_kwsReadyBuf;
                                      (unsigned long)(cw1 - cw0));
             }
 #endif
-			
+
             am_util_stdio_printf("[mic] Press short=play (PCM), hold 2s=test tone.\n");
 #ifndef KWS_DISABLE
-            g_mfccFrameCount = 0;
             g_kwsReadyBuf    = 0xFF;
             g_kwsWritePos    = 0;
+#if WW_TEST_MODE
+            // Discard the partial window collected before recording started;
+            // it is not contiguous with what comes next.
+            g_wwFrameCount  = 0;
+            g_wwWindowPeak  = 0;
+            g_wwPrimed      = false;
+            g_wwPreemphPrev = 0;
+            memset(g_wwWindow, 0, sizeof(g_wwWindow));
+#elif CHEW_TEST_MODE
+            g_chewFrameCount  = 0;
+            g_chewWindowPeak  = 0;
+            g_chewPrimed      = false;
+            g_chewPreemphPrev = 0;
+            memset(g_chewWindow, 0, sizeof(g_chewWindow));
+#else
+            g_mfccFrameCount = 0;
+#endif
 #endif
             g_mode           = MIC_MODE_INITIAL;
         }
@@ -1239,9 +2075,23 @@ uint32_t readyBuf = g_kwsReadyBuf;
             g_toneDone = false;
             am_util_stdio_printf("[mic] Test tone done.\n");
 #ifndef KWS_DISABLE
-            g_mfccFrameCount = 0;
             g_kwsReadyBuf    = 0xFF;
             g_kwsWritePos    = 0;
+#if WW_TEST_MODE
+            g_wwFrameCount  = 0;
+            g_wwWindowPeak  = 0;
+            g_wwPrimed      = false;
+            g_wwPreemphPrev = 0;
+            memset(g_wwWindow, 0, sizeof(g_wwWindow));
+#elif CHEW_TEST_MODE
+            g_chewFrameCount  = 0;
+            g_chewWindowPeak  = 0;
+            g_chewPrimed      = false;
+            g_chewPreemphPrev = 0;
+            memset(g_chewWindow, 0, sizeof(g_chewWindow));
+#else
+            g_mfccFrameCount = 0;
+#endif
 #endif
             g_mode           = MIC_MODE_INITIAL;
         }
@@ -1250,9 +2100,23 @@ uint32_t readyBuf = g_kwsReadyBuf;
             g_playDone = false;
             am_util_stdio_printf("[mic] Playback done.\n");
 #ifndef KWS_DISABLE
-            g_mfccFrameCount = 0;
             g_kwsReadyBuf    = 0xFF;
             g_kwsWritePos    = 0;
+#if WW_TEST_MODE
+            g_wwFrameCount  = 0;
+            g_wwWindowPeak  = 0;
+            g_wwPrimed      = false;
+            g_wwPreemphPrev = 0;
+            memset(g_wwWindow, 0, sizeof(g_wwWindow));
+#elif CHEW_TEST_MODE
+            g_chewFrameCount  = 0;
+            g_chewWindowPeak  = 0;
+            g_chewPrimed      = false;
+            g_chewPreemphPrev = 0;
+            memset(g_chewWindow, 0, sizeof(g_chewWindow));
+#else
+            g_mfccFrameCount = 0;
+#endif
 #endif
             g_mode           = MIC_MODE_INITIAL;
         }
@@ -1272,6 +2136,13 @@ uint32_t readyBuf = g_kwsReadyBuf;
                                      (unsigned)xPortGetFreeHeapSize(),
                                      (unsigned)xPortGetMinimumEverFreeHeapSize(),
                                      (unsigned)configTOTAL_HEAP_SIZE);
+#if !defined(KWS_DISABLE) && WW_TEST_MODE
+                am_util_stdio_printf("[ww] inferences so far: %lu\n",
+                                     (unsigned long)g_wwInferCount);
+#elif !defined(KWS_DISABLE) && CHEW_TEST_MODE
+                am_util_stdio_printf("[chew] inferences so far: %lu\n",
+                                     (unsigned long)g_chewInferCount);
+#endif
             }
         }
 
@@ -1286,6 +2157,14 @@ uint32_t readyBuf = g_kwsReadyBuf;
                                    (g_mode == MODE_TESTTONE)  ? "TONE" : "IDLE";
                 am_util_stdio_printf("[mic] avg=%ld peak=%ld mode=%s\n",
                                      (long)g_secAvg, (long)g_secPeakLast, mstr);
+                // 960000 cycles = 1% of one second at 96 MHz.
+                am_util_stdio_printf("[mic] isr: %lu%% cpu  %lu calls  "
+                                     "%lu samples  %lu cyc/sample\n",
+                                     (unsigned long)(g_isrCyclesRpt / 960000),
+                                     (unsigned long)g_isrCallsRpt,
+                                     (unsigned long)g_isrSamplesRpt,
+                                     (unsigned long)(g_isrSamplesRpt ?
+                                         g_isrCyclesRpt / g_isrSamplesRpt : 0));
             }
         }
     }

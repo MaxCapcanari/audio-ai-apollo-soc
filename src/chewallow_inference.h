@@ -7,10 +7,7 @@
 extern "C" {
 #endif
 
-// Model input: (1, 79, 24, 1) float32 — 79 frames of 24-coefficient MFCC,
-// nfft=1024, winlen=0.064, winstep=0.032, nfilt=32, experiment=2
-// (zeroth coefficient retained -> 24 cols), covering 2.5s of audio.
-#define CHEWALLOW_NUM_FRAMES   79
+#define CHEWALLOW_NUM_FRAMES   78
 #define CHEWALLOW_NUM_COEFFS   24
 #define CHEWALLOW_INPUT_SIZE   (CHEWALLOW_NUM_FRAMES * CHEWALLOW_NUM_COEFFS)  // 1896
 
@@ -24,10 +21,7 @@ extern const char *chewallow_label_names[CHEWALLOW_NUM_CLASSES];
 // Call once at startup before any chewallow_run() calls.
 void chewallow_init(void);
 
-// Run inference on a (CHEWALLOW_NUM_FRAMES x CHEWALLOW_NUM_COEFFS) float
-// MFCC feature buffer that has ALREADY been globally z-score normalized
-// (mean 0, std 1 across the whole 250x22 matrix), matching the notebook's
-// preprocess_wav_to_model_input(). This function does NOT normalize for you.
+
 // Writes class-1 ("chewallow") probability to *p_chewallow_out.
 // Returns the index of the highest-scoring class, or -1 on error.
 int chewallow_run(const float *mfcc_features, float *p_chewallow_out);

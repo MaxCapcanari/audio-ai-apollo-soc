@@ -5,15 +5,15 @@
 // Static standard-normal noise (mean 0, std 1), matching the shape
 // and rough statistics of a real globally z-score normalized MFCC
 // window. For timing only - not valid for accuracy testing.
-// Shape:     (79, 24) = 1896 floats
+// Shape:     (78, 24) = 1872 floats
 // Seed:      1234
-// Generated: 2026-08-07 18:33:25
+// Generated: 2026-08-27 17:01:24
 
-#define CHEWALLOW_DUMMY_FRAMES 79
+#define CHEWALLOW_DUMMY_FRAMES 78
 #define CHEWALLOW_DUMMY_COEFFS 24
-#define CHEWALLOW_DUMMY_LEN    1896
+#define CHEWALLOW_DUMMY_LEN    1872
 
-static const float g_chewallow_dummy_input[1896] = {
+static const float g_chewallow_dummy_input[1872] = {
      1.054220f, -0.225557f,  2.197041f,  0.103492f,  1.226198f, -0.492013f, -0.198115f, -0.368908f,
      0.075994f, -0.731246f,  1.730470f,  0.339287f, -0.793302f,  1.150298f, -0.423485f, -0.377227f,
      0.201191f,  0.450035f,  1.150116f,  0.105939f,  0.356503f, -0.079919f, -1.082857f, -0.285936f,
@@ -247,10 +247,7 @@ static const float g_chewallow_dummy_input[1896] = {
     -0.015107f, -2.356734f,  0.847758f, -0.573553f, -0.768078f,  0.926208f, -0.839241f,  0.546200f,
     -0.316726f,  1.403297f,  0.627633f,  1.085657f,  0.142757f, -0.776014f,  0.064079f,  0.377778f,
      1.751090f,  1.181799f, -0.117918f, -0.244681f,  1.045705f, -0.251703f,  1.908684f,  0.158074f,
-     1.886775f,  0.584190f, -2.117519f,  0.588754f,  0.418105f, -1.242366f,  2.107567f, -0.217226f,
-    -0.276440f, -0.143967f, -0.275234f, -0.504734f,  0.681996f,  0.499921f,  0.328632f, -1.852179f,
-    -1.184504f,  1.151424f,  1.316775f, -0.766189f,  0.789871f, -0.151019f, -0.075556f, -1.079356f,
-    -0.758929f,  0.756790f, -0.113552f,  0.046106f,  0.361319f, -1.064688f,  0.567714f,  0.120439f
+     1.886775f,  0.584190f, -2.117519f,  0.588754f,  0.418105f, -1.242366f,  2.107567f, -0.217226f
 };
 
 #endif  // CHEWALLOW_DUMMY_INPUT_H

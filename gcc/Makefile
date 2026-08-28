@@ -216,6 +216,7 @@ SRC = gap_main.c
 else
 SRC = kws_inference.cc
 SRC += chewallow_inference.cc
+SRC += ww_inference.cc
 SRC += gap_main.c
 endif
 SRC += attc_disc.c

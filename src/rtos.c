@@ -27,6 +27,8 @@
 #ifndef KWS_DISABLE
 #include "chewallow_inference.h"
 #include "chewallow_dummy_input.h"
+#include "ww_inference.h"
+#include "ww_dummy_input.h"
 #endif
 
 extern TaskHandle_t radio_task_handle;
@@ -70,6 +72,15 @@ ButtonTask(void *pvParameters)
                         TickType_t c1 = xTaskGetTickCount();
                         am_util_stdio_printf("[timing] chewallow rc=%d inference=%lu ms hwm=%u words\n",
                                              rc, (unsigned long)(c1 - c0),
+                                             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+                    }
+{
+                        float wwProb = 0.0f;
+                        TickType_t w0 = xTaskGetTickCount();
+                        int rc = ww_run_dummy_timing(g_ww_dummy_input, &wwProb);
+                        TickType_t w1 = xTaskGetTickCount();
+                        am_util_stdio_printf("[timing] ww rc=%d inference=%lu ms hwm=%u\n",
+                                             rc, (unsigned long)(w1 - w0),
                                              (unsigned)uxTaskGetStackHighWaterMark(NULL));
                     }
 #endif
